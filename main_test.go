@@ -43,7 +43,7 @@ func TestRunCLIHelp(t *testing.T) {
 	}
 
 	help := stdout.String()
-	for _, want := range []string{"Usage of download:", "-url", "-bytes", "-count", "-min-interval", "(default 262144)", "(default 100)", "(default 1s)"} {
+	for _, want := range []string{"Usage of tlad:", "-url", "-bytes", "-count", "-min-interval", "(default 262144)", "(default 100)", "(default 1s)"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help output %q does not contain %q", help, want)
 		}

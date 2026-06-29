@@ -88,7 +88,7 @@ func printUsage(out io.Writer) {
 }
 
 func newFlagSet(cfg *config) *flag.FlagSet {
-	fs := flag.NewFlagSet("download", flag.ContinueOnError)
+	fs := flag.NewFlagSet("tlad", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&cfg.url, "url", "", "http or https URL to download")
 	fs.Int64Var(&cfg.bytes, "bytes", defaultBytes, "maximum number of bytes to read per request")
