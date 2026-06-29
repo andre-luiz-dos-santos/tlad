@@ -15,30 +15,38 @@ import (
 )
 
 const (
-	defaultBytes     = int64(256 * 1024)
-	defaultStartPort = 40000
-	defaultCount     = 100
-	defaultStep      = 1
-	defaultTimeout   = 30 * time.Second
+	defaultBytes       = int64(256 * 1024)
+	defaultStartPort   = 40000
+	defaultCount       = 100
+	defaultStep        = 1
+	defaultTimeout     = 30 * time.Second
+	defaultMinInterval = time.Second
 )
 
 type config struct {
-	url       string
-	bytes     int64
-	startPort int
-	count     int
-	step      int
-	timeout   time.Duration
+	url         string
+	bytes       int64
+	startPort   int
+	count       int
+	step        int
+	timeout     time.Duration
+	minInterval time.Duration
 
 	tlsConfig *tls.Config
 }
 
 type result struct {
-	port    int
-	status  string
-	bytes   int64
-	elapsed time.Duration
-	err     error
+	port       int
+	statusCode int
+	status     string
+	bytes      int64
+	elapsed    time.Duration
+	err        error
+}
+
+type requestPacer struct {
+	minInterval time.Duration
+	lastStart   time.Time
 }
 
 func main() {
@@ -88,6 +96,7 @@ func newFlagSet(cfg *config) *flag.FlagSet {
 	fs.IntVar(&cfg.count, "count", defaultCount, "number of sequential requests to make")
 	fs.IntVar(&cfg.step, "step", defaultStep, "local port increment between requests")
 	fs.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "per-request timeout")
+	fs.DurationVar(&cfg.minInterval, "min-interval", defaultMinInterval, "minimum time between request attempts")
 	return fs
 }
 
@@ -120,6 +129,9 @@ func (cfg config) validate() error {
 	if cfg.timeout <= 0 {
 		return errors.New("-timeout must be greater than zero")
 	}
+	if cfg.minInterval <= 0 {
+		return errors.New("-min-interval must be greater than zero")
+	}
 
 	lastPort := int64(cfg.startPort) + int64(cfg.count-1)*int64(cfg.step)
 	if lastPort > 65535 {
@@ -131,9 +143,10 @@ func (cfg config) validate() error {
 
 func run(ctx context.Context, cfg config, out io.Writer) error {
 	var failed bool
+	pacer := &requestPacer{minInterval: cfg.minInterval}
 	for i := 0; i < cfg.count; i++ {
 		port := cfg.startPort + i*cfg.step
-		res := download(ctx, cfg, port)
+		res := downloadWithPacer(ctx, cfg, port, pacer)
 		printResult(out, res)
 		if res.err != nil {
 			failed = true
@@ -146,8 +159,46 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 }
 
 func download(ctx context.Context, cfg config, localPort int) result {
+	pacer := &requestPacer{minInterval: cfg.minInterval}
+	return downloadWithPacer(ctx, cfg, localPort, pacer)
+}
+
+func downloadWithPacer(ctx context.Context, cfg config, localPort int, pacer *requestPacer) result {
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{
+			Port: localPort,
+		},
+	}
+	transport := &http.Transport{
+		DialContext:     dialer.DialContext,
+		TLSClientConfig: cfg.tlsConfig,
+	}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{Transport: transport}
+	for {
+		res := downloadAttempt(ctx, cfg, localPort, client, pacer)
+		if res.statusCode != http.StatusTooManyRequests || cfg.minInterval <= 0 {
+			return res
+		}
+		if err := sleepContext(ctx, 10*cfg.minInterval); err != nil {
+			res.err = fmt.Errorf("429 retry wait canceled: %w", err)
+			return res
+		}
+	}
+}
+
+func downloadAttempt(ctx context.Context, cfg config, localPort int, client *http.Client, pacer *requestPacer) result {
 	start := time.Now()
 	res := result{port: localPort}
+
+	var err error
+	start, err = pacer.wait(ctx)
+	if err != nil {
+		res.elapsed = time.Since(start)
+		res.err = err
+		return res
+	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
 	defer cancel()
@@ -160,19 +211,6 @@ func download(ctx context.Context, cfg config, localPort int) result {
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", cfg.bytes-1))
 
-	dialer := &net.Dialer{
-		LocalAddr: &net.TCPAddr{
-			Port: localPort,
-		},
-	}
-	transport := &http.Transport{
-		DialContext:       dialer.DialContext,
-		DisableKeepAlives: true,
-		TLSClientConfig:   cfg.tlsConfig,
-	}
-	defer transport.CloseIdleConnections()
-
-	client := &http.Client{Transport: transport}
 	resp, err := client.Do(req)
 	if err != nil {
 		res.elapsed = time.Since(start)
@@ -181,8 +219,13 @@ func download(ctx context.Context, cfg config, localPort int) result {
 	}
 	defer resp.Body.Close()
 
+	res.statusCode = resp.StatusCode
 	res.status = resp.Status
-	res.bytes, err = io.Copy(io.Discard, io.LimitReader(resp.Body, cfg.bytes))
+	if resp.StatusCode == http.StatusTooManyRequests && cfg.minInterval > 0 {
+		res.bytes, err = io.Copy(io.Discard, resp.Body)
+	} else {
+		res.bytes, err = io.Copy(io.Discard, io.LimitReader(resp.Body, cfg.bytes))
+	}
 	res.elapsed = time.Since(start)
 	if err != nil {
 		res.err = err
@@ -192,6 +235,34 @@ func download(ctx context.Context, cfg config, localPort int) result {
 		res.err = fmt.Errorf("server returned %s", resp.Status)
 	}
 	return res
+}
+
+func (p *requestPacer) wait(ctx context.Context) (time.Time, error) {
+	if p == nil {
+		return time.Now(), nil
+	}
+	if p.minInterval > 0 && !p.lastStart.IsZero() {
+		wait := p.minInterval - time.Since(p.lastStart)
+		if wait > 0 {
+			if err := sleepContext(ctx, wait); err != nil {
+				return time.Now(), err
+			}
+		}
+	}
+	p.lastStart = time.Now()
+	return p.lastStart, nil
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func printResult(out io.Writer, res result) {

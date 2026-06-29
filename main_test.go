@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -26,6 +27,9 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.count != 100 {
 		t.Fatalf("count = %d, want 100", cfg.count)
 	}
+	if cfg.minInterval != time.Second {
+		t.Fatalf("minInterval = %s, want 1s", cfg.minInterval)
+	}
 }
 
 func TestRunCLIHelp(t *testing.T) {
@@ -39,7 +43,7 @@ func TestRunCLIHelp(t *testing.T) {
 	}
 
 	help := stdout.String()
-	for _, want := range []string{"Usage of download:", "-url", "-bytes", "-count", "(default 262144)", "(default 100)"} {
+	for _, want := range []string{"Usage of download:", "-url", "-bytes", "-count", "-min-interval", "(default 262144)", "(default 100)", "(default 1s)"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help output %q does not contain %q", help, want)
 		}
@@ -94,6 +98,16 @@ func TestParseConfigValidation(t *testing.T) {
 			args: []string{"-url", "https://example.com/file", "-start-port", "65535", "-count", "2"},
 			want: "port sequence exceeds 65535",
 		},
+		{
+			name: "zero min interval",
+			args: []string{"-url", "https://example.com/file", "-min-interval", "0"},
+			want: "-min-interval must be greater than zero",
+		},
+		{
+			name: "negative min interval",
+			args: []string{"-url", "https://example.com/file", "-min-interval", "-1s"},
+			want: "-min-interval must be greater than zero",
+		},
 	}
 
 	for _, tt := range tests {
@@ -119,12 +133,13 @@ func TestHTTPDownloadLimitsBytesAndSendsRange(t *testing.T) {
 
 	port := freeLocalPort(t)
 	res := download(context.Background(), config{
-		url:       server.URL,
-		bytes:     12,
-		startPort: port,
-		count:     1,
-		step:      1,
-		timeout:   5 * time.Second,
+		url:         server.URL,
+		bytes:       12,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
 	}, port)
 
 	if res.err != nil {
@@ -146,13 +161,14 @@ func TestHTTPSDownload(t *testing.T) {
 
 	port := freeLocalPort(t)
 	res := download(context.Background(), config{
-		url:       server.URL,
-		bytes:     5,
-		startPort: port,
-		count:     1,
-		step:      1,
-		timeout:   5 * time.Second,
-		tlsConfig: server.Client().Transport.(*http.Transport).TLSClientConfig,
+		url:         server.URL,
+		bytes:       5,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
+		tlsConfig:   server.Client().Transport.(*http.Transport).TLSClientConfig,
 	}, port)
 
 	if res.err != nil {
@@ -184,12 +200,13 @@ func TestRunUsesExpectedPortSequence(t *testing.T) {
 
 	var out bytes.Buffer
 	err := run(context.Background(), config{
-		url:       server.URL,
-		bytes:     2,
-		startPort: ports[0],
-		count:     len(ports),
-		step:      1,
-		timeout:   5 * time.Second,
+		url:         server.URL,
+		bytes:       2,
+		startPort:   ports[0],
+		count:       len(ports),
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
 	}, &out)
 	if err != nil {
 		t.Fatalf("run failed: %v\noutput:\n%s", err, out.String())
@@ -204,6 +221,103 @@ func TestRunUsesExpectedPortSequence(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for request %d", i)
 		}
+	}
+}
+
+func TestRunHonorsMinimumInterval(t *testing.T) {
+	ports := freeLocalPortSequence(t, 3)
+	requestTimes := make(chan time.Time, len(ports))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestTimes <- time.Now()
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	var out bytes.Buffer
+	minInterval := 25 * time.Millisecond
+	err := run(context.Background(), config{
+		url:         server.URL,
+		bytes:       2,
+		startPort:   ports[0],
+		count:       len(ports),
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: minInterval,
+	}, &out)
+	if err != nil {
+		t.Fatalf("run failed: %v\noutput:\n%s", err, out.String())
+	}
+
+	times := make([]time.Time, len(ports))
+	for i := range times {
+		select {
+		case times[i] = <-requestTimes:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for request %d", i)
+		}
+	}
+	for i := 1; i < len(times); i++ {
+		if elapsed := times[i].Sub(times[i-1]); elapsed < minInterval-5*time.Millisecond {
+			t.Fatalf("request %d started %s after previous request, want at least %s", i, elapsed, minInterval)
+		}
+	}
+}
+
+func TestDownloadRetries429OnSamePortAfterBackoff(t *testing.T) {
+	var attempts atomic.Int32
+	remotePorts := make(chan int, 2)
+	requestTimes := make(chan time.Time, 2)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestTimes <- time.Now()
+		_, portText, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			t.Errorf("invalid remote addr %q: %v", r.RemoteAddr, err)
+			return
+		}
+		var port int
+		if _, err := fmt.Sscanf(portText, "%d", &port); err != nil {
+			t.Errorf("invalid remote port %q: %v", portText, err)
+			return
+		}
+		remotePorts <- port
+
+		if attempts.Add(1) == 1 {
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	port := freeLocalPort(t)
+	minInterval := 5 * time.Millisecond
+	res := download(context.Background(), config{
+		url:         server.URL,
+		bytes:       2,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: minInterval,
+	}, port)
+	if res.err != nil {
+		t.Fatalf("download failed: %v", res.err)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+
+	firstPort := <-remotePorts
+	secondPort := <-remotePorts
+	if firstPort != secondPort {
+		t.Fatalf("retry used local port %d, want same port %d", secondPort, firstPort)
+	}
+
+	firstTime := <-requestTimes
+	secondTime := <-requestTimes
+	if elapsed := secondTime.Sub(firstTime); elapsed < 10*minInterval {
+		t.Fatalf("retry started after %s, want at least %s", elapsed, 10*minInterval)
 	}
 }
 
