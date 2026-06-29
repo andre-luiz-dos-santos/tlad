@@ -13,6 +13,9 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 const (
@@ -43,6 +46,7 @@ type result struct {
 	bytes      int64
 	elapsed    time.Duration
 	tcpStats   tcpStats
+	quicStats  quicStats
 	err        error
 }
 
@@ -58,16 +62,35 @@ type tcpStats struct {
 	err       error
 }
 
+type quicStats struct {
+	available       bool
+	packetsLost     uint64
+	bytesLost       uint64
+	packetsSent     uint64
+	packetsReceived uint64
+	latestRTT       time.Duration
+	smoothedRTT     time.Duration
+	err             error
+}
+
 type tcpConnTracker struct {
 	mu        sync.Mutex
 	conn      *net.TCPConn
 	lastStats tcpStats
 }
 
+type quicConnTracker struct {
+	mu        sync.Mutex
+	conn      *quic.Conn
+	lastStats quicStats
+}
+
 type trackedTCPConn struct {
 	*net.TCPConn
 	tracker *tcpConnTracker
 }
+
+type captureStatsFunc func(*result)
 
 func main() {
 	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
@@ -110,9 +133,9 @@ func printUsage(out io.Writer) {
 func newFlagSet(cfg *config) *flag.FlagSet {
 	fs := flag.NewFlagSet("tlad", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.StringVar(&cfg.url, "url", "", "http or https URL to download")
+	fs.StringVar(&cfg.url, "url", "", "http, https, or quic URL to download")
 	fs.Int64Var(&cfg.bytes, "bytes", defaultBytes, "maximum number of bytes to read per request")
-	fs.IntVar(&cfg.startPort, "start-port", defaultStartPort, "first local TCP source port")
+	fs.IntVar(&cfg.startPort, "start-port", defaultStartPort, "first local TCP or UDP source port")
 	fs.IntVar(&cfg.count, "count", defaultCount, "number of sequential requests to make")
 	fs.IntVar(&cfg.step, "step", defaultStep, "local port increment between requests")
 	fs.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "per-request timeout")
@@ -128,8 +151,8 @@ func (cfg config) validate() error {
 	if err != nil {
 		return fmt.Errorf("invalid -url: %w", err)
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("unsupported URL scheme %q: only http and https are supported", parsed.Scheme)
+	if parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "quic" {
+		return fmt.Errorf("unsupported URL scheme %q: only http, https, and quic are supported", parsed.Scheme)
 	}
 	if parsed.Host == "" {
 		return errors.New("invalid -url: missing host")
@@ -184,6 +207,17 @@ func download(ctx context.Context, cfg config, localPort int) result {
 }
 
 func downloadWithPacer(ctx context.Context, cfg config, localPort int, pacer *requestPacer) result {
+	requestURL, err := requestURLForTransport(cfg.url)
+	if err != nil {
+		return result{port: localPort, err: err}
+	}
+	if isQUICURL(cfg.url) {
+		return downloadQUICWithPacer(ctx, cfg, requestURL, localPort, pacer)
+	}
+	return downloadHTTPWithPacer(ctx, cfg, requestURL, localPort, pacer)
+}
+
+func downloadHTTPWithPacer(ctx context.Context, cfg config, requestURL string, localPort int, pacer *requestPacer) result {
 	dialer := &net.Dialer{
 		LocalAddr: &net.TCPAddr{
 			Port: localPort,
@@ -192,24 +226,66 @@ func downloadWithPacer(ctx context.Context, cfg config, localPort int, pacer *re
 	tracker := &tcpConnTracker{}
 	transport := &http.Transport{
 		DialContext:     tracker.dialContext(dialer),
-		TLSClientConfig: cfg.tlsConfig,
+		TLSClientConfig: insecureTLSConfig(cfg.tlsConfig),
 	}
 	defer transport.CloseIdleConnections()
 
 	client := &http.Client{Transport: transport}
+	return downloadWithClient(ctx, cfg, requestURL, localPort, client, pacer, func(res *result) {
+		res.tcpStats = tracker.tcpInfo()
+	})
+}
+
+func downloadQUICWithPacer(ctx context.Context, cfg config, requestURL string, localPort int, pacer *requestPacer) result {
+	tracker := &quicConnTracker{}
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: localPort})
+	if err != nil {
+		return result{port: localPort, err: fmt.Errorf("bind local UDP port %d: %w", localPort, err)}
+	}
+
+	quicTransport := &quic.Transport{Conn: udpConn}
+	transport := &http3.Transport{
+		TLSClientConfig: insecureTLSConfig(cfg.tlsConfig),
+		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
+			udpAddr, err := net.ResolveUDPAddr("udp", addr)
+			if err != nil {
+				return nil, err
+			}
+			conn, err := quicTransport.Dial(ctx, udpAddr, tlsCfg, quicCfg)
+			if err != nil {
+				return nil, err
+			}
+			tracker.set(conn)
+			return conn, nil
+		},
+	}
+	defer func() {
+		_ = transport.Close()
+		_ = quicTransport.Close()
+		_ = udpConn.Close()
+	}()
+
+	client := &http.Client{Transport: transport}
+	return downloadWithClient(ctx, cfg, requestURL, localPort, client, pacer, func(res *result) {
+		res.quicStats = tracker.quicStats()
+	})
+}
+
+func downloadWithClient(ctx context.Context, cfg config, requestURL string, localPort int, client *http.Client, pacer *requestPacer, captureStats captureStatsFunc) result {
 	for {
-		res := downloadAttempt(ctx, cfg, localPort, client, pacer, tracker)
+		res := downloadAttempt(ctx, cfg, requestURL, localPort, client, pacer, captureStats)
 		if res.statusCode != http.StatusTooManyRequests || cfg.minInterval <= 0 {
 			return res
 		}
 		if err := sleepContext(ctx, 10*cfg.minInterval); err != nil {
 			res.err = fmt.Errorf("429 retry wait canceled: %w", err)
+			captureStats(&res)
 			return res
 		}
 	}
 }
 
-func downloadAttempt(ctx context.Context, cfg config, localPort int, client *http.Client, pacer *requestPacer, tracker *tcpConnTracker) result {
+func downloadAttempt(ctx context.Context, cfg config, requestURL string, localPort int, client *http.Client, pacer *requestPacer, captureStats captureStatsFunc) result {
 	start := time.Now()
 	res := result{port: localPort}
 
@@ -218,18 +294,18 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
-		res.tcpStats = tracker.tcpInfo()
+		captureStats(&res)
 		return res
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, cfg.url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
-		res.tcpStats = tracker.tcpInfo()
+		captureStats(&res)
 		return res
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", cfg.bytes-1))
@@ -238,7 +314,7 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
-		res.tcpStats = tracker.tcpInfo()
+		captureStats(&res)
 		return res
 	}
 
@@ -252,16 +328,45 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	res.elapsed = time.Since(start)
 	if err != nil {
 		res.err = err
-		res.tcpStats = tracker.tcpInfo()
 		_ = resp.Body.Close()
+		captureStats(&res)
 		return res
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
 		res.err = fmt.Errorf("server returned %s", resp.Status)
 	}
-	res.tcpStats = tracker.tcpInfo()
 	_ = resp.Body.Close()
+	captureStats(&res)
 	return res
+}
+
+func requestURLForTransport(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme != "quic" {
+		return rawURL, nil
+	}
+
+	transportURL := *parsed
+	transportURL.Scheme = "https"
+	return transportURL.String(), nil
+}
+
+func isQUICURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	return err == nil && parsed.Scheme == "quic"
+}
+
+func insecureTLSConfig(base *tls.Config) *tls.Config {
+	if base == nil {
+		return &tls.Config{InsecureSkipVerify: true}
+	}
+
+	cfg := base.Clone()
+	cfg.InsecureSkipVerify = true
+	return cfg
 }
 
 func (t *tcpConnTracker) dialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
@@ -336,6 +441,72 @@ func (t *tcpConnTracker) setStats(stats tcpStats) {
 	t.lastStats = stats
 }
 
+func (t *quicConnTracker) set(conn *quic.Conn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.conn = conn
+	t.lastStats = quicStats{}
+}
+
+func (t *quicConnTracker) latest() *quic.Conn {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.conn
+}
+
+func (t *quicConnTracker) quicStats() quicStats {
+	if t == nil {
+		return quicStats{err: errors.New("quic connection unavailable")}
+	}
+
+	conn := t.latest()
+	if conn != nil {
+		stats := quicStatsForConn(conn)
+		t.setStats(stats)
+		return stats
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.lastStats.available {
+		return t.lastStats
+	}
+	return quicStats{err: errors.New("quic connection unavailable")}
+}
+
+func (t *quicConnTracker) setStats(stats quicStats) {
+	if t == nil || !stats.available {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.lastStats = stats
+}
+
+func quicStatsForConn(conn *quic.Conn) quicStats {
+	if conn == nil {
+		return quicStats{err: errors.New("quic connection unavailable")}
+	}
+
+	stats := conn.ConnectionStats()
+	return quicStats{
+		available:       true,
+		packetsLost:     stats.PacketsLost,
+		bytesLost:       stats.BytesLost,
+		packetsSent:     stats.PacketsSent,
+		packetsReceived: stats.PacketsReceived,
+		latestRTT:       stats.LatestRTT,
+		smoothedRTT:     stats.SmoothedRTT,
+	}
+}
+
 func (p *requestPacer) wait(ctx context.Context) (time.Time, error) {
 	if p == nil {
 		return time.Now(), nil
@@ -377,6 +548,15 @@ func printResult(out io.Writer, res result) {
 	}
 	if res.tcpStats.available {
 		fmt.Fprintf(out, " tx_retrans=%d rx_ooo=%d", res.tcpStats.txRetrans, res.tcpStats.rxOOO)
+	}
+	if res.quicStats.available {
+		fmt.Fprintf(out, " quic_packets_lost=%d quic_bytes_lost=%d quic_packets_sent=%d quic_packets_received=%d quic_latest_rtt=%s quic_smoothed_rtt=%s",
+			res.quicStats.packetsLost,
+			res.quicStats.bytesLost,
+			res.quicStats.packetsSent,
+			res.quicStats.packetsReceived,
+			res.quicStats.latestRTT.Round(time.Millisecond),
+			res.quicStats.smoothedRTT.Round(time.Millisecond))
 	}
 	fmt.Fprintln(out)
 }

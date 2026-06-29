@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go/http3"
 )
 
 func TestParseConfigDefaults(t *testing.T) {
@@ -44,10 +47,16 @@ func TestRunCLIHelp(t *testing.T) {
 	}
 
 	help := stdout.String()
-	for _, want := range []string{"Usage of tlad:", "-url", "-bytes", "-count", "-min-interval", "(default 262144)", "(default 100)", "(default 1s)"} {
+	for _, want := range []string{"Usage of tlad:", "-url", "http, https, or quic", "-bytes", "-count", "-min-interval", "(default 262144)", "(default 100)", "(default 1s)"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help output %q does not contain %q", help, want)
 		}
+	}
+}
+
+func TestParseConfigAcceptsQUIC(t *testing.T) {
+	if _, err := parseConfig([]string{"-url", "quic://example.com/file"}); err != nil {
+		t.Fatalf("parseConfig failed for quic URL: %v", err)
 	}
 }
 
@@ -182,6 +191,25 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 			},
 			want: "port=40002 status=\"200 OK\" bytes=24 elapsed=2ms\n",
 		},
+		{
+			name: "quic stats",
+			res: result{
+				port:    40004,
+				status:  "206 Partial Content",
+				bytes:   123,
+				elapsed: time.Second,
+				quicStats: quicStats{
+					available:       true,
+					packetsLost:     1,
+					bytesLost:       1200,
+					packetsSent:     10,
+					packetsReceived: 9,
+					latestRTT:       25 * time.Millisecond,
+					smoothedRTT:     30 * time.Millisecond,
+				},
+			},
+			want: "port=40004 status=\"206 Partial Content\" bytes=123 elapsed=1s quic_packets_lost=1 quic_bytes_lost=1200 quic_packets_sent=10 quic_packets_received=9 quic_latest_rtt=25ms quic_smoothed_rtt=30ms\n",
+		},
 	}
 
 	for _, tt := range tests {
@@ -225,7 +253,7 @@ func TestHTTPDownloadLimitsBytesAndSendsRange(t *testing.T) {
 	}
 }
 
-func TestHTTPSDownload(t *testing.T) {
+func TestHTTPSDownloadAcceptsSelfSignedCertificate(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "hello over tls")
 	}))
@@ -240,7 +268,6 @@ func TestHTTPSDownload(t *testing.T) {
 		step:        1,
 		timeout:     5 * time.Second,
 		minInterval: time.Millisecond,
-		tlsConfig:   server.Client().Transport.(*http.Transport).TLSClientConfig,
 	}, port)
 
 	if res.err != nil {
@@ -248,6 +275,49 @@ func TestHTTPSDownload(t *testing.T) {
 	}
 	if res.bytes != 5 {
 		t.Fatalf("read %d bytes, want 5", res.bytes)
+	}
+}
+
+func TestQUICDownloadLimitsBytesSendsRangeAndUsesUDPSourcePort(t *testing.T) {
+	var gotRange string
+	seenPort := make(chan int, 1)
+	server := newHTTP3TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRange = r.Header.Get("Range")
+		seenPort <- remotePortFromRequest(t, r)
+		_, _ = io.WriteString(w, strings.Repeat("q", 128))
+	}))
+
+	port := freeLocalUDPPort(t)
+	res := download(context.Background(), config{
+		url:         server.url,
+		bytes:       12,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
+	}, port)
+
+	if res.err != nil {
+		t.Fatalf("download failed: %v", res.err)
+	}
+	if res.bytes != 12 {
+		t.Fatalf("read %d bytes, want 12", res.bytes)
+	}
+	if gotRange != "bytes=0-11" {
+		t.Fatalf("Range header = %q, want %q", gotRange, "bytes=0-11")
+	}
+	if !res.quicStats.available {
+		t.Fatalf("quic stats unavailable: %v", res.quicStats.err)
+	}
+
+	select {
+	case got := <-seenPort:
+		if got != port {
+			t.Fatalf("request used UDP source port %d, want %d", got, port)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for QUIC request")
 	}
 }
 
@@ -455,6 +525,122 @@ func TestDownloadRetries429OnSamePortAfterBackoff(t *testing.T) {
 	}
 }
 
+func TestQUICDownloadRetries429OnSameUDPPortAfterBackoff(t *testing.T) {
+	var attempts atomic.Int32
+	remotePorts := make(chan int, 2)
+	requestTimes := make(chan time.Time, 2)
+
+	server := newHTTP3TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestTimes <- time.Now()
+		remotePorts <- remotePortFromRequest(t, r)
+
+		if attempts.Add(1) == 1 {
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+
+	port := freeLocalUDPPort(t)
+	minInterval := 5 * time.Millisecond
+	res := download(context.Background(), config{
+		url:         server.url,
+		bytes:       2,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: minInterval,
+	}, port)
+	if res.err != nil {
+		t.Fatalf("download failed: %v", res.err)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+	if !res.quicStats.available {
+		t.Fatalf("quic stats unavailable: %v", res.quicStats.err)
+	}
+
+	firstPort := <-remotePorts
+	secondPort := <-remotePorts
+	if firstPort != secondPort {
+		t.Fatalf("retry used UDP source port %d, want same port %d", secondPort, firstPort)
+	}
+	if firstPort != port {
+		t.Fatalf("request used UDP source port %d, want %d", firstPort, port)
+	}
+
+	firstTime := <-requestTimes
+	secondTime := <-requestTimes
+	if elapsed := secondTime.Sub(firstTime); elapsed < 10*minInterval {
+		t.Fatalf("retry started after %s, want at least %s", elapsed, 10*minInterval)
+	}
+}
+
+type http3TestServer struct {
+	url string
+}
+
+func newHTTP3TestServer(t *testing.T, handler http.Handler) *http3TestServer {
+	t.Helper()
+
+	certServer := httptest.NewTLSServer(http.NotFoundHandler())
+	certs := certServer.TLS.Certificates
+	certServer.Close()
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen for HTTP/3 test server: %v", err)
+	}
+
+	server := &http3.Server{
+		Handler: handler,
+		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{
+			Certificates: certs,
+		}),
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(conn)
+	}()
+
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = conn.Close()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("HTTP/3 test server failed: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out closing HTTP/3 test server")
+		}
+	})
+
+	return &http3TestServer{
+		url: "quic://" + conn.LocalAddr().String(),
+	}
+}
+
+func remotePortFromRequest(t *testing.T, r *http.Request) int {
+	t.Helper()
+
+	addr, ok := r.Context().Value(http3.RemoteAddrContextKey).(net.Addr)
+	if !ok {
+		t.Fatalf("missing HTTP/3 remote address")
+	}
+	_, portText, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		t.Fatalf("invalid remote addr %q: %v", addr.String(), err)
+	}
+	var port int
+	if _, err := fmt.Sscanf(portText, "%d", &port); err != nil {
+		t.Fatalf("invalid remote port %q: %v", portText, err)
+	}
+	return port
+}
+
 func freeLocalPort(t *testing.T) int {
 	t.Helper()
 
@@ -465,6 +651,18 @@ func freeLocalPort(t *testing.T) int {
 	defer listener.Close()
 
 	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func freeLocalUDPPort(t *testing.T) int {
+	t.Helper()
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen for free UDP port: %v", err)
+	}
+	defer conn.Close()
+
+	return conn.LocalAddr().(*net.UDPAddr).Port
 }
 
 func freeLocalPortSequence(t *testing.T, count int) []int {
