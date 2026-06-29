@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	defaultBytes     = int64(1024)
+	defaultBytes     = int64(256 * 1024)
 	defaultStartPort = 40000
-	defaultCount     = 1
+	defaultCount     = 100
 	defaultStep      = 1
 	defaultTimeout   = 30 * time.Second
 )
@@ -42,19 +42,44 @@ type result struct {
 }
 
 func main() {
-	cfg, err := parseConfig(os.Args[1:])
+	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func runCLI(args []string, stdout, stderr io.Writer) int {
+	cfg, err := parseConfig(args)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+		if errors.Is(err, flag.ErrHelp) {
+			printUsage(stdout)
+			return 0
+		}
+		fmt.Fprintln(stderr, err)
+		return 2
 	}
 
-	if err := run(context.Background(), cfg, os.Stdout); err != nil {
-		os.Exit(1)
+	if err := run(context.Background(), cfg, stdout); err != nil {
+		return 1
 	}
+	return 0
 }
 
 func parseConfig(args []string) (config, error) {
 	cfg := config{}
+	fs := newFlagSet(&cfg)
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+
+	return cfg, cfg.validate()
+}
+
+func printUsage(out io.Writer) {
+	cfg := config{}
+	fs := newFlagSet(&cfg)
+	fs.SetOutput(out)
+	fs.Usage()
+}
+
+func newFlagSet(cfg *config) *flag.FlagSet {
 	fs := flag.NewFlagSet("download", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&cfg.url, "url", "", "http or https URL to download")
@@ -63,12 +88,7 @@ func parseConfig(args []string) (config, error) {
 	fs.IntVar(&cfg.count, "count", defaultCount, "number of sequential requests to make")
 	fs.IntVar(&cfg.step, "step", defaultStep, "local port increment between requests")
 	fs.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "per-request timeout")
-
-	if err := fs.Parse(args); err != nil {
-		return config{}, err
-	}
-
-	return cfg, cfg.validate()
+	return fs
 }
 
 func (cfg config) validate() error {

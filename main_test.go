@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +14,44 @@ import (
 	"testing"
 	"time"
 )
+
+func TestParseConfigDefaults(t *testing.T) {
+	cfg, err := parseConfig([]string{"-url", "https://example.com/file"})
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+	if cfg.bytes != 256*1024 {
+		t.Fatalf("bytes = %d, want %d", cfg.bytes, 256*1024)
+	}
+	if cfg.count != 100 {
+		t.Fatalf("count = %d, want 100", cfg.count)
+	}
+}
+
+func TestRunCLIHelp(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runCLI([]string{"-h"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+
+	help := stdout.String()
+	for _, want := range []string{"Usage of download:", "-url", "-bytes", "-count", "(default 262144)", "(default 100)"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help output %q does not contain %q", help, want)
+		}
+	}
+}
+
+func TestParseConfigHelp(t *testing.T) {
+	_, err := parseConfig([]string{"-h"})
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("error = %v, want flag.ErrHelp", err)
+	}
+}
 
 func TestParseConfigValidation(t *testing.T) {
 	tests := []struct {
