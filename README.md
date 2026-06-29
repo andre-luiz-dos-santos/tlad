@@ -50,12 +50,12 @@ go build -o tlad .
 ## Example Output
 
 ```text
-port=40000 status="206 Partial Content" bytes=262144 elapsed=1.421s error="-" tx_retrans=0 rx_ooo=0 tcpinfo_error="-"
-port=40001 status="206 Partial Content" bytes=262144 elapsed=863ms error="-" tx_retrans=0 rx_ooo=0 tcpinfo_error="-"
-port=40002 status="206 Partial Content" bytes=163555 elapsed=30.001s error="context deadline exceeded" tx_retrans=2 rx_ooo=1 tcpinfo_error="-"
+port=40000 status="206 Partial Content" bytes=262144 elapsed=1.421s tx_retrans=0 rx_ooo=0
+port=40001 status="206 Partial Content" bytes=262144 elapsed=863ms tx_retrans=0 rx_ooo=0
+port=40002 status="206 Partial Content" bytes=163555 elapsed=30.001s error="context deadline exceeded" tx_retrans=2 rx_ooo=1
 ```
 
-The TCP fields are read from the local TCP stack when supported. On Linux, `tx_retrans` is `TCP_INFO.tcpi_total_retrans`, and `rx_ooo` is `TCP_INFO.tcpi_rcv_ooopack` for out-of-order received packets. `rx_ooo` is a receive-side signal that can indicate server-to-client loss or reordering, not an exact remote packet-loss counter. If TCP_INFO cannot be read, the numeric fields are `-` and `tcpinfo_error` explains why.
+The TCP fields are read from the local TCP stack when supported. On Linux, `tx_retrans` is `TCP_INFO.tcpi_total_retrans`, and `rx_ooo` is `TCP_INFO.tcpi_rcv_ooopack` for out-of-order received packets. `rx_ooo` is a receive-side signal that can indicate server-to-client loss or reordering, not an exact remote packet-loss counter. If TCP_INFO cannot be read, the TCP fields are omitted.
 
 ## Exit Codes
 

@@ -123,7 +123,7 @@ func TestParseConfigValidation(t *testing.T) {
 	}
 }
 
-func TestPrintResultIncludesTCPInfo(t *testing.T) {
+func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 	tests := []struct {
 		name string
 		res  result
@@ -142,10 +142,10 @@ func TestPrintResultIncludesTCPInfo(t *testing.T) {
 					rxOOO:     3,
 				},
 			},
-			want: "port=40000 status=\"206 Partial Content\" bytes=12345 elapsed=1.5s error=\"-\" tx_retrans=7 rx_ooo=3 tcpinfo_error=\"-\"\n",
+			want: "port=40000 status=\"206 Partial Content\" bytes=12345 elapsed=1.5s tx_retrans=7 rx_ooo=3\n",
 		},
 		{
-			name: "unavailable",
+			name: "error without tcp stats",
 			res: result{
 				port:     40001,
 				bytes:    42,
@@ -153,7 +153,17 @@ func TestPrintResultIncludesTCPInfo(t *testing.T) {
 				err:      errors.New("download failed"),
 				tcpStats: tcpStats{err: errors.New("tcp_info unsupported on this platform")},
 			},
-			want: "port=40001 status=\"-\" bytes=42 elapsed=1ms error=\"download failed\" tx_retrans=- rx_ooo=- tcpinfo_error=\"tcp_info unsupported on this platform\"\n",
+			want: "port=40001 status=\"-\" bytes=42 elapsed=1ms error=\"download failed\"\n",
+		},
+		{
+			name: "success without tcp stats",
+			res: result{
+				port:    40002,
+				status:  "200 OK",
+				bytes:   24,
+				elapsed: 2 * time.Millisecond,
+			},
+			want: "port=40002 status=\"200 OK\" bytes=24 elapsed=2ms\n",
 		},
 	}
 
@@ -273,10 +283,11 @@ func TestRunUsesExpectedPortSequence(t *testing.T) {
 		t.Fatalf("output line count = %d, want %d\noutput:\n%s", len(lines), len(ports), out.String())
 	}
 	for _, line := range lines {
-		for _, want := range []string{" tx_retrans=", " rx_ooo=", " tcpinfo_error="} {
-			if !strings.Contains(line, want) {
-				t.Fatalf("output line %q does not contain %q", line, want)
-			}
+		if strings.Contains(line, " error=") {
+			t.Fatalf("successful output line %q unexpectedly contains an error field", line)
+		}
+		if strings.Contains(line, " tcpinfo_error=") {
+			t.Fatalf("output line %q unexpectedly contains a tcpinfo_error field", line)
 		}
 	}
 }

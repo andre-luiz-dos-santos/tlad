@@ -317,24 +317,18 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 }
 
 func printResult(out io.Writer, res result) {
-	errText := "-"
-	if res.err != nil {
-		errText = res.err.Error()
-	}
 	status := res.status
 	if status == "" {
 		status = "-"
 	}
-	txRetrans := "-"
-	rxOOO := "-"
+
+	fmt.Fprintf(out, "port=%d status=%q bytes=%d elapsed=%s",
+		res.port, status, res.bytes, res.elapsed.Round(time.Millisecond))
+	if res.err != nil {
+		fmt.Fprintf(out, " error=%q", res.err.Error())
+	}
 	if res.tcpStats.available {
-		txRetrans = fmt.Sprintf("%d", res.tcpStats.txRetrans)
-		rxOOO = fmt.Sprintf("%d", res.tcpStats.rxOOO)
+		fmt.Fprintf(out, " tx_retrans=%d rx_ooo=%d", res.tcpStats.txRetrans, res.tcpStats.rxOOO)
 	}
-	tcpInfoErr := "-"
-	if res.tcpStats.err != nil {
-		tcpInfoErr = res.tcpStats.err.Error()
-	}
-	fmt.Fprintf(out, "port=%d status=%q bytes=%d elapsed=%s error=%q tx_retrans=%s rx_ooo=%s tcpinfo_error=%q\n",
-		res.port, status, res.bytes, res.elapsed.Round(time.Millisecond), errText, txRetrans, rxOOO, tcpInfoErr)
+	fmt.Fprintln(out)
 }
