@@ -35,6 +35,7 @@ type config struct {
 	step        int
 	timeout     time.Duration
 	minInterval time.Duration
+	ipv6        bool
 
 	tlsConfig *tls.Config
 }
@@ -140,6 +141,7 @@ func newFlagSet(cfg *config) *flag.FlagSet {
 	fs.IntVar(&cfg.step, "step", defaultStep, "local port increment between requests")
 	fs.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "per-request timeout")
 	fs.DurationVar(&cfg.minInterval, "min-interval", defaultMinInterval, "minimum time between request attempts")
+	fs.BoolVar(&cfg.ipv6, "ipv6", false, "force download connections over IPv6")
 	return fs
 }
 
@@ -225,7 +227,7 @@ func downloadHTTPWithPacer(ctx context.Context, cfg config, requestURL string, l
 	}
 	tracker := &tcpConnTracker{}
 	transport := &http.Transport{
-		DialContext:     tracker.dialContext(dialer),
+		DialContext:     tracker.dialContext(dialer, cfg.ipv6),
 		TLSClientConfig: insecureTLSConfig(cfg.tlsConfig),
 	}
 	defer transport.CloseIdleConnections()
@@ -238,7 +240,8 @@ func downloadHTTPWithPacer(ctx context.Context, cfg config, requestURL string, l
 
 func downloadQUICWithPacer(ctx context.Context, cfg config, requestURL string, localPort int, pacer *requestPacer) result {
 	tracker := &quicConnTracker{}
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: localPort})
+	network := udpNetwork(cfg.ipv6)
+	udpConn, err := net.ListenUDP(network, &net.UDPAddr{Port: localPort})
 	if err != nil {
 		return result{port: localPort, err: fmt.Errorf("bind local UDP port %d: %w", localPort, err)}
 	}
@@ -247,7 +250,7 @@ func downloadQUICWithPacer(ctx context.Context, cfg config, requestURL string, l
 	transport := &http3.Transport{
 		TLSClientConfig: insecureTLSConfig(cfg.tlsConfig),
 		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
-			udpAddr, err := net.ResolveUDPAddr("udp", addr)
+			udpAddr, err := net.ResolveUDPAddr(network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -369,8 +372,11 @@ func insecureTLSConfig(base *tls.Config) *tls.Config {
 	return cfg
 }
 
-func (t *tcpConnTracker) dialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+func (t *tcpConnTracker) dialContext(dialer *net.Dialer, forceIPv6 bool) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		if forceIPv6 {
+			network = "tcp6"
+		}
 		conn, err := dialer.DialContext(ctx, network, address)
 		if err != nil {
 			return nil, err
@@ -384,6 +390,13 @@ func (t *tcpConnTracker) dialContext(dialer *net.Dialer) func(context.Context, s
 		}
 		return conn, nil
 	}
+}
+
+func udpNetwork(forceIPv6 bool) string {
+	if forceIPv6 {
+		return "udp6"
+	}
+	return "udp"
 }
 
 func (c *trackedTCPConn) Close() error {

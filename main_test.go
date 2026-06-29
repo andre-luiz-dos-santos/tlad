@@ -34,6 +34,9 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.minInterval != time.Second {
 		t.Fatalf("minInterval = %s, want 1s", cfg.minInterval)
 	}
+	if cfg.ipv6 {
+		t.Fatal("ipv6 = true, want false")
+	}
 }
 
 func TestRunCLIHelp(t *testing.T) {
@@ -47,7 +50,7 @@ func TestRunCLIHelp(t *testing.T) {
 	}
 
 	help := stdout.String()
-	for _, want := range []string{"Usage of tlad:", "-url", "http, https, or quic", "-bytes", "-count", "-min-interval", "(default 262144)", "(default 100)", "(default 1s)"} {
+	for _, want := range []string{"Usage of tlad:", "-url", "http, https, or quic", "-bytes", "-count", "-min-interval", "-ipv6", "(default 262144)", "(default 100)", "(default 1s)"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help output %q does not contain %q", help, want)
 		}
@@ -57,6 +60,16 @@ func TestRunCLIHelp(t *testing.T) {
 func TestParseConfigAcceptsQUIC(t *testing.T) {
 	if _, err := parseConfig([]string{"-url", "quic://example.com/file"}); err != nil {
 		t.Fatalf("parseConfig failed for quic URL: %v", err)
+	}
+}
+
+func TestParseConfigIPv6(t *testing.T) {
+	cfg, err := parseConfig([]string{"-url", "https://example.com/file", "-ipv6"})
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+	if !cfg.ipv6 {
+		t.Fatal("ipv6 = false, want true")
 	}
 }
 
@@ -278,6 +291,48 @@ func TestHTTPSDownloadAcceptsSelfSignedCertificate(t *testing.T) {
 	}
 }
 
+func TestHTTPDownloadCanForceIPv6(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+
+	remoteAddrs := make(chan string, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteAddrs <- r.RemoteAddr
+		_, _ = io.WriteString(w, "hello over ipv6")
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	port := freeLocalIPv6Port(t)
+	res := download(context.Background(), config{
+		url:         server.URL,
+		bytes:       5,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
+		ipv6:        true,
+	}, port)
+
+	if res.err != nil {
+		t.Fatalf("download failed: %v", res.err)
+	}
+	if res.bytes != 5 {
+		t.Fatalf("read %d bytes, want 5", res.bytes)
+	}
+
+	select {
+	case remoteAddr := <-remoteAddrs:
+		assertIPv6RemotePort(t, remoteAddr, port)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HTTP request")
+	}
+}
+
 func TestQUICDownloadLimitsBytesSendsRangeAndUsesUDPSourcePort(t *testing.T) {
 	var gotRange string
 	seenPort := make(chan int, 1)
@@ -316,6 +371,43 @@ func TestQUICDownloadLimitsBytesSendsRangeAndUsesUDPSourcePort(t *testing.T) {
 		if got != port {
 			t.Fatalf("request used UDP source port %d, want %d", got, port)
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for QUIC request")
+	}
+}
+
+func TestQUICDownloadCanForceIPv6(t *testing.T) {
+	remoteAddrs := make(chan string, 1)
+	server := newHTTP3IPv6TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteAddrs <- remoteAddrFromRequest(t, r)
+		_, _ = io.WriteString(w, strings.Repeat("q", 128))
+	}))
+
+	port := freeLocalIPv6UDPPort(t)
+	res := download(context.Background(), config{
+		url:         server.url,
+		bytes:       12,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
+		ipv6:        true,
+	}, port)
+
+	if res.err != nil {
+		t.Fatalf("download failed: %v", res.err)
+	}
+	if res.bytes != 12 {
+		t.Fatalf("read %d bytes, want 12", res.bytes)
+	}
+	if !res.quicStats.available {
+		t.Fatalf("quic stats unavailable: %v", res.quicStats.err)
+	}
+
+	select {
+	case remoteAddr := <-remoteAddrs:
+		assertIPv6RemotePort(t, remoteAddr, port)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for QUIC request")
 	}
@@ -585,14 +677,31 @@ type http3TestServer struct {
 func newHTTP3TestServer(t *testing.T, handler http.Handler) *http3TestServer {
 	t.Helper()
 
-	certServer := httptest.NewTLSServer(http.NotFoundHandler())
-	certs := certServer.TLS.Certificates
-	certServer.Close()
-
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatalf("listen for HTTP/3 test server: %v", err)
 	}
+
+	return newHTTP3TestServerWithConn(t, handler, conn)
+}
+
+func newHTTP3IPv6TestServer(t *testing.T, handler http.Handler) *http3TestServer {
+	t.Helper()
+
+	conn, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("::1")})
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+
+	return newHTTP3TestServerWithConn(t, handler, conn)
+}
+
+func newHTTP3TestServerWithConn(t *testing.T, handler http.Handler, conn *net.UDPConn) *http3TestServer {
+	t.Helper()
+
+	certServer := httptest.NewTLSServer(http.NotFoundHandler())
+	certs := certServer.TLS.Certificates
+	certServer.Close()
 
 	server := &http3.Server{
 		Handler: handler,
@@ -626,19 +735,49 @@ func newHTTP3TestServer(t *testing.T, handler http.Handler) *http3TestServer {
 func remotePortFromRequest(t *testing.T, r *http.Request) int {
 	t.Helper()
 
-	addr, ok := r.Context().Value(http3.RemoteAddrContextKey).(net.Addr)
-	if !ok {
-		t.Fatalf("missing HTTP/3 remote address")
-	}
-	_, portText, err := net.SplitHostPort(addr.String())
+	addr := remoteAddrFromRequest(t, r)
+	_, portText, err := net.SplitHostPort(addr)
 	if err != nil {
-		t.Fatalf("invalid remote addr %q: %v", addr.String(), err)
+		t.Fatalf("invalid remote addr %q: %v", addr, err)
 	}
 	var port int
 	if _, err := fmt.Sscanf(portText, "%d", &port); err != nil {
 		t.Fatalf("invalid remote port %q: %v", portText, err)
 	}
 	return port
+}
+
+func remoteAddrFromRequest(t *testing.T, r *http.Request) string {
+	t.Helper()
+
+	addr, ok := r.Context().Value(http3.RemoteAddrContextKey).(net.Addr)
+	if !ok {
+		t.Fatalf("missing HTTP/3 remote address")
+	}
+	return addr.String()
+}
+
+func assertIPv6RemotePort(t *testing.T, remoteAddr string, wantPort int) {
+	t.Helper()
+
+	host, portText, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		t.Fatalf("invalid remote addr %q: %v", remoteAddr, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		t.Fatalf("remote host %q is not an IP address", host)
+	}
+	if ip.To4() != nil {
+		t.Fatalf("remote host %q is IPv4, want IPv6", host)
+	}
+	var gotPort int
+	if _, err := fmt.Sscanf(portText, "%d", &gotPort); err != nil {
+		t.Fatalf("invalid remote port %q: %v", portText, err)
+	}
+	if gotPort != wantPort {
+		t.Fatalf("request used source port %d, want %d", gotPort, wantPort)
+	}
 }
 
 func freeLocalPort(t *testing.T) int {
@@ -653,12 +792,36 @@ func freeLocalPort(t *testing.T) int {
 	return listener.Addr().(*net.TCPAddr).Port
 }
 
+func freeLocalIPv6Port(t *testing.T) int {
+	t.Helper()
+
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	defer listener.Close()
+
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
 func freeLocalUDPPort(t *testing.T) int {
 	t.Helper()
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatalf("listen for free UDP port: %v", err)
+	}
+	defer conn.Close()
+
+	return conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func freeLocalIPv6UDPPort(t *testing.T) int {
+	t.Helper()
+
+	conn, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("::1")})
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
 	}
 	defer conn.Close()
 

@@ -9,6 +9,7 @@ It is useful when you need to test how repeated downloads behave across specific
 - Download from HTTP, HTTPS, and HTTP/3-over-QUIC URLs.
 - Limit bytes read per request with `-bytes`.
 - Bind each request to a predictable local TCP or UDP source port sequence with `-start-port`, `-count`, and `-step`.
+- Force download connections over IPv6 with `-ipv6`.
 - Pace request attempts with `-min-interval`.
 - Retry HTTP `429 Too Many Requests` responses after `10 * min-interval` using the same local port.
 - Report local TCP_INFO counters for retransmits and out-of-order received packets when supported.
@@ -47,6 +48,7 @@ go build -o tlad .
 | `-step` | `1` | Local port increment between requests. |
 | `-timeout` | `30s` | Per-request timeout. |
 | `-min-interval` | `1s` | Minimum time between request attempts. |
+| `-ipv6` | `false` | Force download connections over IPv6. |
 
 ## Example Output
 
