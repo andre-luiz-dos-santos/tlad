@@ -59,8 +59,14 @@ type tcpStats struct {
 }
 
 type tcpConnTracker struct {
-	mu   sync.Mutex
-	conn *net.TCPConn
+	mu        sync.Mutex
+	conn      *net.TCPConn
+	lastStats tcpStats
+}
+
+type trackedTCPConn struct {
+	*net.TCPConn
+	tracker *tcpConnTracker
 }
 
 func main() {
@@ -212,7 +218,7 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
-		res.tcpStats = tcpInfoForConn(tracker.latest())
+		res.tcpStats = tracker.tcpInfo()
 		return res
 	}
 
@@ -223,7 +229,7 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
-		res.tcpStats = tcpInfoForConn(tracker.latest())
+		res.tcpStats = tracker.tcpInfo()
 		return res
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", cfg.bytes-1))
@@ -232,7 +238,7 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
-		res.tcpStats = tcpInfoForConn(tracker.latest())
+		res.tcpStats = tracker.tcpInfo()
 		return res
 	}
 
@@ -246,14 +252,14 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	res.elapsed = time.Since(start)
 	if err != nil {
 		res.err = err
-		res.tcpStats = tcpInfoForConn(tracker.latest())
+		res.tcpStats = tracker.tcpInfo()
 		_ = resp.Body.Close()
 		return res
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
 		res.err = fmt.Errorf("server returned %s", resp.Status)
 	}
-	res.tcpStats = tcpInfoForConn(tracker.latest())
+	res.tcpStats = tracker.tcpInfo()
 	_ = resp.Body.Close()
 	return res
 }
@@ -266,9 +272,20 @@ func (t *tcpConnTracker) dialContext(dialer *net.Dialer) func(context.Context, s
 		}
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			t.set(tcpConn)
+			return &trackedTCPConn{
+				TCPConn: tcpConn,
+				tracker: t,
+			}, nil
 		}
 		return conn, nil
 	}
+}
+
+func (c *trackedTCPConn) Close() error {
+	if c.tracker != nil {
+		c.tracker.setStats(tcpInfoForConn(c.TCPConn))
+	}
+	return c.TCPConn.Close()
 }
 
 func (t *tcpConnTracker) set(conn *net.TCPConn) {
@@ -276,6 +293,7 @@ func (t *tcpConnTracker) set(conn *net.TCPConn) {
 	defer t.mu.Unlock()
 
 	t.conn = conn
+	t.lastStats = tcpStats{}
 }
 
 func (t *tcpConnTracker) latest() *net.TCPConn {
@@ -286,6 +304,36 @@ func (t *tcpConnTracker) latest() *net.TCPConn {
 	defer t.mu.Unlock()
 
 	return t.conn
+}
+
+func (t *tcpConnTracker) tcpInfo() tcpStats {
+	if t == nil {
+		return tcpInfoForConn(nil)
+	}
+
+	stats := tcpInfoForConn(t.latest())
+	if stats.available {
+		t.setStats(stats)
+		return stats
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.lastStats.available {
+		return t.lastStats
+	}
+	return stats
+}
+
+func (t *tcpConnTracker) setStats(stats tcpStats) {
+	if t == nil || !stats.available {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.lastStats = stats
 }
 
 func (p *requestPacer) wait(ctx context.Context) (time.Time, error) {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -156,6 +157,22 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 			want: "port=40001 status=\"-\" bytes=42 elapsed=1ms error=\"download failed\"\n",
 		},
 		{
+			name: "error with tcp stats",
+			res: result{
+				port:    40003,
+				status:  "206 Partial Content",
+				bytes:   163555,
+				elapsed: 30001 * time.Millisecond,
+				err:     context.DeadlineExceeded,
+				tcpStats: tcpStats{
+					available: true,
+					txRetrans: 2,
+					rxOOO:     1,
+				},
+			},
+			want: "port=40003 status=\"206 Partial Content\" bytes=163555 elapsed=30.001s error=\"context deadline exceeded\" tx_retrans=2 rx_ooo=1\n",
+		},
+		{
 			name: "success without tcp stats",
 			res: result{
 				port:    40002,
@@ -231,6 +248,55 @@ func TestHTTPSDownload(t *testing.T) {
 	}
 	if res.bytes != 5 {
 		t.Fatalf("read %d bytes, want 5", res.bytes)
+	}
+}
+
+func TestDownloadTimeoutRetainsTCPStats(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("TCP_INFO is only supported on Linux")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "partial body")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	port := freeLocalPort(t)
+	res := download(context.Background(), config{
+		url:         server.URL,
+		bytes:       1024 * 1024,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     50 * time.Millisecond,
+		minInterval: time.Millisecond,
+	}, port)
+
+	if res.err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if res.statusCode != http.StatusPartialContent {
+		t.Fatalf("status code = %d, want %d", res.statusCode, http.StatusPartialContent)
+	}
+	if res.bytes != int64(len("partial body")) {
+		t.Fatalf("read %d bytes, want %d", res.bytes, len("partial body"))
+	}
+	if !res.tcpStats.available {
+		t.Fatalf("tcp stats unavailable after timeout: %v", res.tcpStats.err)
+	}
+
+	var out bytes.Buffer
+	printResult(&out, res)
+	line := out.String()
+	for _, want := range []string{"error=", "tx_retrans=", "rx_ooo="} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("output %q does not contain %q", line, want)
+		}
 	}
 }
 
