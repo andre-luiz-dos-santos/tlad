@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -41,12 +42,25 @@ type result struct {
 	status     string
 	bytes      int64
 	elapsed    time.Duration
+	tcpStats   tcpStats
 	err        error
 }
 
 type requestPacer struct {
 	minInterval time.Duration
 	lastStart   time.Time
+}
+
+type tcpStats struct {
+	available bool
+	txRetrans uint32
+	rxOOO     uint32
+	err       error
+}
+
+type tcpConnTracker struct {
+	mu   sync.Mutex
+	conn *net.TCPConn
 }
 
 func main() {
@@ -169,15 +183,16 @@ func downloadWithPacer(ctx context.Context, cfg config, localPort int, pacer *re
 			Port: localPort,
 		},
 	}
+	tracker := &tcpConnTracker{}
 	transport := &http.Transport{
-		DialContext:     dialer.DialContext,
+		DialContext:     tracker.dialContext(dialer),
 		TLSClientConfig: cfg.tlsConfig,
 	}
 	defer transport.CloseIdleConnections()
 
 	client := &http.Client{Transport: transport}
 	for {
-		res := downloadAttempt(ctx, cfg, localPort, client, pacer)
+		res := downloadAttempt(ctx, cfg, localPort, client, pacer, tracker)
 		if res.statusCode != http.StatusTooManyRequests || cfg.minInterval <= 0 {
 			return res
 		}
@@ -188,7 +203,7 @@ func downloadWithPacer(ctx context.Context, cfg config, localPort int, pacer *re
 	}
 }
 
-func downloadAttempt(ctx context.Context, cfg config, localPort int, client *http.Client, pacer *requestPacer) result {
+func downloadAttempt(ctx context.Context, cfg config, localPort int, client *http.Client, pacer *requestPacer, tracker *tcpConnTracker) result {
 	start := time.Now()
 	res := result{port: localPort}
 
@@ -197,6 +212,7 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
+		res.tcpStats = tcpInfoForConn(tracker.latest())
 		return res
 	}
 
@@ -207,6 +223,7 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
+		res.tcpStats = tcpInfoForConn(tracker.latest())
 		return res
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", cfg.bytes-1))
@@ -215,9 +232,9 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
+		res.tcpStats = tcpInfoForConn(tracker.latest())
 		return res
 	}
-	defer resp.Body.Close()
 
 	res.statusCode = resp.StatusCode
 	res.status = resp.Status
@@ -229,12 +246,46 @@ func downloadAttempt(ctx context.Context, cfg config, localPort int, client *htt
 	res.elapsed = time.Since(start)
 	if err != nil {
 		res.err = err
+		res.tcpStats = tcpInfoForConn(tracker.latest())
+		_ = resp.Body.Close()
 		return res
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
 		res.err = fmt.Errorf("server returned %s", resp.Status)
 	}
+	res.tcpStats = tcpInfoForConn(tracker.latest())
+	_ = resp.Body.Close()
 	return res
+}
+
+func (t *tcpConnTracker) dialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			t.set(tcpConn)
+		}
+		return conn, nil
+	}
+}
+
+func (t *tcpConnTracker) set(conn *net.TCPConn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.conn = conn
+}
+
+func (t *tcpConnTracker) latest() *net.TCPConn {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.conn
 }
 
 func (p *requestPacer) wait(ctx context.Context) (time.Time, error) {
@@ -274,6 +325,16 @@ func printResult(out io.Writer, res result) {
 	if status == "" {
 		status = "-"
 	}
-	fmt.Fprintf(out, "port=%d status=%q bytes=%d elapsed=%s error=%q\n",
-		res.port, status, res.bytes, res.elapsed.Round(time.Millisecond), errText)
+	txRetrans := "-"
+	rxOOO := "-"
+	if res.tcpStats.available {
+		txRetrans = fmt.Sprintf("%d", res.tcpStats.txRetrans)
+		rxOOO = fmt.Sprintf("%d", res.tcpStats.rxOOO)
+	}
+	tcpInfoErr := "-"
+	if res.tcpStats.err != nil {
+		tcpInfoErr = res.tcpStats.err.Error()
+	}
+	fmt.Fprintf(out, "port=%d status=%q bytes=%d elapsed=%s error=%q tx_retrans=%s rx_ooo=%s tcpinfo_error=%q\n",
+		res.port, status, res.bytes, res.elapsed.Round(time.Millisecond), errText, txRetrans, rxOOO, tcpInfoErr)
 }

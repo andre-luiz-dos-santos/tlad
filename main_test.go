@@ -123,6 +123,51 @@ func TestParseConfigValidation(t *testing.T) {
 	}
 }
 
+func TestPrintResultIncludesTCPInfo(t *testing.T) {
+	tests := []struct {
+		name string
+		res  result
+		want string
+	}{
+		{
+			name: "available",
+			res: result{
+				port:    40000,
+				status:  "206 Partial Content",
+				bytes:   12345,
+				elapsed: 1500 * time.Millisecond,
+				tcpStats: tcpStats{
+					available: true,
+					txRetrans: 7,
+					rxOOO:     3,
+				},
+			},
+			want: "port=40000 status=\"206 Partial Content\" bytes=12345 elapsed=1.5s error=\"-\" tx_retrans=7 rx_ooo=3 tcpinfo_error=\"-\"\n",
+		},
+		{
+			name: "unavailable",
+			res: result{
+				port:     40001,
+				bytes:    42,
+				elapsed:  time.Millisecond,
+				err:      errors.New("download failed"),
+				tcpStats: tcpStats{err: errors.New("tcp_info unsupported on this platform")},
+			},
+			want: "port=40001 status=\"-\" bytes=42 elapsed=1ms error=\"download failed\" tx_retrans=- rx_ooo=- tcpinfo_error=\"tcp_info unsupported on this platform\"\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			printResult(&out, tt.res)
+			if got := out.String(); got != tt.want {
+				t.Fatalf("output = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHTTPDownloadLimitsBytesAndSendsRange(t *testing.T) {
 	var gotRange string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -220,6 +265,18 @@ func TestRunUsesExpectedPortSequence(t *testing.T) {
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for request %d", i)
+		}
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != len(ports) {
+		t.Fatalf("output line count = %d, want %d\noutput:\n%s", len(lines), len(ports), out.String())
+	}
+	for _, line := range lines {
+		for _, want := range []string{" tx_retrans=", " rx_ooo=", " tcpinfo_error="} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("output line %q does not contain %q", line, want)
+			}
 		}
 	}
 }
