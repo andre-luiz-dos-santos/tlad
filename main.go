@@ -566,24 +566,41 @@ func printResult(out io.Writer, res result) {
 		fmt.Fprintf(out, " error=%q", res.err.Error())
 	}
 	if res.tcpStats.available {
-		fmt.Fprintf(out, " tx_retrans=%d tx_lost_current=%d tx_retrans_current=%d tx_retrans_bytes=%d dsack_dups=%d rx_ooo=%d rx_reord_seen=%d rx_data_segs=%d",
-			res.tcpStats.txRetrans,
-			res.tcpStats.txLostCurrent,
-			res.tcpStats.txRetransCurrent,
-			res.tcpStats.txRetransBytes,
-			res.tcpStats.dsackDups,
-			res.tcpStats.rxOOO,
-			res.tcpStats.rxReordSeen,
-			res.tcpStats.rxDataSegs)
+		printNonZeroUint32(out, "tx_retrans", res.tcpStats.txRetrans)
+		printNonZeroUint32(out, "tx_lost_current", res.tcpStats.txLostCurrent)
+		printNonZeroUint32(out, "tx_retrans_current", res.tcpStats.txRetransCurrent)
+		printNonZeroUint64(out, "tx_retrans_bytes", res.tcpStats.txRetransBytes)
+		printNonZeroUint32(out, "dsack_dups", res.tcpStats.dsackDups)
+		printNonZeroUint32(out, "rx_ooo", res.tcpStats.rxOOO)
+		printNonZeroUint32(out, "rx_reord_seen", res.tcpStats.rxReordSeen)
+		printNonZeroUint32(out, "rx_data_segs", res.tcpStats.rxDataSegs)
 	}
 	if res.quicStats.available {
-		fmt.Fprintf(out, " quic_packets_lost=%d quic_bytes_lost=%d quic_packets_sent=%d quic_packets_received=%d quic_latest_rtt=%s quic_smoothed_rtt=%s",
-			res.quicStats.packetsLost,
-			res.quicStats.bytesLost,
-			res.quicStats.packetsSent,
-			res.quicStats.packetsReceived,
-			res.quicStats.latestRTT.Round(time.Millisecond),
-			res.quicStats.smoothedRTT.Round(time.Millisecond))
+		printNonZeroUint64(out, "quic_packets_lost", res.quicStats.packetsLost)
+		printNonZeroUint64(out, "quic_bytes_lost", res.quicStats.bytesLost)
+		printNonZeroUint64(out, "quic_packets_sent", res.quicStats.packetsSent)
+		printNonZeroUint64(out, "quic_packets_received", res.quicStats.packetsReceived)
+		printNonZeroDuration(out, "quic_latest_rtt", res.quicStats.latestRTT)
+		printNonZeroDuration(out, "quic_smoothed_rtt", res.quicStats.smoothedRTT)
 	}
 	fmt.Fprintln(out)
+}
+
+func printNonZeroUint32(out io.Writer, name string, value uint32) {
+	if value != 0 {
+		fmt.Fprintf(out, " %s=%d", name, value)
+	}
+}
+
+func printNonZeroUint64(out io.Writer, name string, value uint64) {
+	if value != 0 {
+		fmt.Fprintf(out, " %s=%d", name, value)
+	}
+}
+
+func printNonZeroDuration(out io.Writer, name string, value time.Duration) {
+	rounded := value.Round(time.Millisecond)
+	if rounded != 0 {
+		fmt.Fprintf(out, " %s=%s", name, rounded)
+	}
 }

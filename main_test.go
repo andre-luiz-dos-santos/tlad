@@ -174,6 +174,23 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 			want: "port=40000 status=\"206 Partial Content\" bytes=12345 elapsed=1.5s tx_retrans=7 tx_lost_current=1 tx_retrans_current=2 tx_retrans_bytes=4096 dsack_dups=4 rx_ooo=3 rx_reord_seen=5 rx_data_segs=6\n",
 		},
 		{
+			name: "mixed zero tcp stats",
+			res: result{
+				port:    40005,
+				status:  "206 Partial Content",
+				bytes:   23456,
+				elapsed: 750 * time.Millisecond,
+				tcpStats: tcpStats{
+					available:        true,
+					txRetrans:        7,
+					txRetransCurrent: 2,
+					dsackDups:        4,
+					rxReordSeen:      5,
+				},
+			},
+			want: "port=40005 status=\"206 Partial Content\" bytes=23456 elapsed=750ms tx_retrans=7 tx_retrans_current=2 dsack_dups=4 rx_reord_seen=5\n",
+		},
+		{
 			name: "error without tcp stats",
 			res: result{
 				port:     40001,
@@ -234,6 +251,35 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 				},
 			},
 			want: "port=40004 status=\"206 Partial Content\" bytes=123 elapsed=1s quic_packets_lost=1 quic_bytes_lost=1200 quic_packets_sent=10 quic_packets_received=9 quic_latest_rtt=25ms quic_smoothed_rtt=30ms\n",
+		},
+		{
+			name: "mixed zero quic stats",
+			res: result{
+				port:    40006,
+				status:  "206 Partial Content",
+				bytes:   456,
+				elapsed: time.Second,
+				quicStats: quicStats{
+					available:   true,
+					packetsLost: 1,
+					packetsSent: 10,
+					latestRTT:   400 * time.Microsecond,
+					smoothedRTT: 30 * time.Millisecond,
+				},
+			},
+			want: "port=40006 status=\"206 Partial Content\" bytes=456 elapsed=1s quic_packets_lost=1 quic_packets_sent=10 quic_smoothed_rtt=30ms\n",
+		},
+		{
+			name: "available all zero stats",
+			res: result{
+				port:      40007,
+				status:    "200 OK",
+				bytes:     24,
+				elapsed:   2 * time.Millisecond,
+				tcpStats:  tcpStats{available: true},
+				quicStats: quicStats{available: true},
+			},
+			want: "port=40007 status=\"200 OK\" bytes=24 elapsed=2ms\n",
 		},
 	}
 
@@ -467,9 +513,12 @@ func TestDownloadTimeoutRetainsTCPStats(t *testing.T) {
 	var out bytes.Buffer
 	printResult(&out, res)
 	line := out.String()
-	for _, want := range []string{"error=", "tx_retrans=", "tx_lost_current=", "tx_retrans_current=", "tx_retrans_bytes=", "dsack_dups=", "rx_ooo=", "rx_reord_seen=", "rx_data_segs="} {
-		if !strings.Contains(line, want) {
-			t.Fatalf("output %q does not contain %q", line, want)
+	if !strings.Contains(line, "error=") {
+		t.Fatalf("output %q does not contain error field", line)
+	}
+	for _, field := range []string{"tx_retrans", "tx_lost_current", "tx_retrans_current", "tx_retrans_bytes", "dsack_dups", "rx_ooo", "rx_reord_seen", "rx_data_segs"} {
+		if strings.Contains(line, field+"=0") {
+			t.Fatalf("output %q contains zero-valued %s field", line, field)
 		}
 	}
 }

@@ -53,14 +53,14 @@ go build -o tlad .
 ## Example Output
 
 ```text
-port=40000 status="206 Partial Content" bytes=262144 elapsed=1.421s tx_retrans=0 tx_lost_current=0 tx_retrans_current=0 tx_retrans_bytes=0 dsack_dups=0 rx_ooo=0 rx_reord_seen=0 rx_data_segs=182
-port=40001 status="206 Partial Content" bytes=262144 elapsed=863ms tx_retrans=0 tx_lost_current=0 tx_retrans_current=0 tx_retrans_bytes=0 dsack_dups=0 rx_ooo=0 rx_reord_seen=0 rx_data_segs=181
-port=40002 status="206 Partial Content" bytes=163555 elapsed=30.001s error="context deadline exceeded" tx_retrans=2 tx_lost_current=0 tx_retrans_current=0 tx_retrans_bytes=96 dsack_dups=0 rx_ooo=1 rx_reord_seen=1 rx_data_segs=114
+port=40000 status="206 Partial Content" bytes=262144 elapsed=1.421s rx_data_segs=182
+port=40001 status="206 Partial Content" bytes=262144 elapsed=863ms rx_data_segs=181
+port=40002 status="206 Partial Content" bytes=163555 elapsed=30.001s error="context deadline exceeded" tx_retrans=2 tx_retrans_bytes=96 rx_ooo=1 rx_reord_seen=1 rx_data_segs=114
 ```
 
 The TCP fields are read from the local TCP stack when supported. On Linux, `tx_retrans` is `TCP_INFO.tcpi_total_retrans`, `tx_lost_current` is `TCP_INFO.tcpi_lost`, `tx_retrans_current` is `TCP_INFO.tcpi_retrans`, `tx_retrans_bytes` is `TCP_INFO.tcpi_bytes_retrans`, `dsack_dups` is `TCP_INFO.tcpi_dsack_dups`, `rx_ooo` is `TCP_INFO.tcpi_rcv_ooopack`, `rx_reord_seen` is `TCP_INFO.tcpi_reord_seen`, and `rx_data_segs` is `TCP_INFO.tcpi_data_segs_in`.
 
-For HTTP and HTTPS downloads, the local process is mostly receiving data, so transmit-side loss and retransmit counters can stay at zero even when server-to-client packets were lost and retransmitted by the server. Linux TCP_INFO does not expose an exact receiver-side packet-loss total for the socket. `rx_ooo`, `rx_reord_seen`, and `rx_data_segs` are receive-side signals that can help identify loss or reordering, but they are not exact remote packet-loss counters. More exact downstream TCP loss evidence requires packet-capture inference from repeated TCP sequence ranges, or sender-side stats from a server you control. If TCP_INFO cannot be read, the TCP fields are omitted.
+For HTTP and HTTPS downloads, the local process is mostly receiving data, so transmit-side loss and retransmit counters can stay at zero even when server-to-client packets were lost and retransmitted by the server. Zero-valued TCP and QUIC stat fields are omitted from output. Linux TCP_INFO does not expose an exact receiver-side packet-loss total for the socket. `rx_ooo`, `rx_reord_seen`, and `rx_data_segs` are receive-side signals that can help identify loss or reordering, but they are not exact remote packet-loss counters. More exact downstream TCP loss evidence requires packet-capture inference from repeated TCP sequence ranges, or sender-side stats from a server you control. If TCP_INFO cannot be read, the TCP fields are omitted.
 
 Use `quic://host/path` to make the request over HTTP/3. The client accepts any TLS certificate for HTTPS and QUIC downloads. QUIC output includes counters such as `quic_packets_lost`, `quic_bytes_lost`, `quic_packets_sent`, `quic_packets_received`, `quic_latest_rtt`, and `quic_smoothed_rtt`.
 
