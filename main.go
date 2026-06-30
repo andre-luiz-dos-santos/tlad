@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -37,6 +38,9 @@ type config struct {
 	minInterval time.Duration
 	ipv6        bool
 
+	endpoint *resolvedEndpoint
+	lookupIP lookupIPFunc
+
 	tlsConfig *tls.Config
 }
 
@@ -54,6 +58,18 @@ type result struct {
 type requestPacer struct {
 	minInterval time.Duration
 	lastStart   time.Time
+}
+
+type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
+
+type resolvedEndpoint struct {
+	host       string
+	port       int
+	portText   string
+	ip         net.IP
+	address    string
+	tcpNetwork string
+	udpNetwork string
 }
 
 type tcpStats struct {
@@ -147,7 +163,7 @@ func newFlagSet(cfg *config) *flag.FlagSet {
 	fs.IntVar(&cfg.step, "step", defaultStep, "local port increment between requests")
 	fs.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "per-request timeout")
 	fs.DurationVar(&cfg.minInterval, "min-interval", defaultMinInterval, "minimum time between request attempts")
-	fs.BoolVar(&cfg.ipv6, "ipv6", false, "force download connections over IPv6")
+	fs.BoolVar(&cfg.ipv6, "ipv6", false, "select an IPv6 address instead of the default IPv4 preference")
 	return fs
 }
 
@@ -193,11 +209,16 @@ func (cfg config) validate() error {
 }
 
 func run(ctx context.Context, cfg config, out io.Writer) error {
+	resolvedCfg, err := cfg.withResolvedEndpoint(ctx)
+	if err != nil {
+		return err
+	}
+
 	var failed bool
-	pacer := &requestPacer{minInterval: cfg.minInterval}
-	for i := 0; i < cfg.count; i++ {
-		port := cfg.startPort + i*cfg.step
-		res := downloadWithPacer(ctx, cfg, port, pacer)
+	pacer := &requestPacer{minInterval: resolvedCfg.minInterval}
+	for i := 0; i < resolvedCfg.count; i++ {
+		port := resolvedCfg.startPort + i*resolvedCfg.step
+		res := downloadWithPacer(ctx, resolvedCfg, port, pacer)
 		printResult(out, res)
 		if res.err != nil {
 			failed = true
@@ -215,14 +236,19 @@ func download(ctx context.Context, cfg config, localPort int) result {
 }
 
 func downloadWithPacer(ctx context.Context, cfg config, localPort int, pacer *requestPacer) result {
+	resolvedCfg, err := cfg.withResolvedEndpoint(ctx)
+	if err != nil {
+		return result{port: localPort, err: err}
+	}
+
 	requestURL, err := requestURLForTransport(cfg.url)
 	if err != nil {
 		return result{port: localPort, err: err}
 	}
 	if isQUICURL(cfg.url) {
-		return downloadQUICWithPacer(ctx, cfg, requestURL, localPort, pacer)
+		return downloadQUICWithPacer(ctx, resolvedCfg, requestURL, localPort, pacer)
 	}
-	return downloadHTTPWithPacer(ctx, cfg, requestURL, localPort, pacer)
+	return downloadHTTPWithPacer(ctx, resolvedCfg, requestURL, localPort, pacer)
 }
 
 func downloadHTTPWithPacer(ctx context.Context, cfg config, requestURL string, localPort int, pacer *requestPacer) result {
@@ -233,7 +259,7 @@ func downloadHTTPWithPacer(ctx context.Context, cfg config, requestURL string, l
 	}
 	tracker := &tcpConnTracker{}
 	transport := &http.Transport{
-		DialContext:     tracker.dialContext(dialer, cfg.ipv6),
+		DialContext:     tracker.dialContext(dialer, cfg.endpoint),
 		TLSClientConfig: insecureTLSConfig(cfg.tlsConfig),
 	}
 	defer transport.CloseIdleConnections()
@@ -246,20 +272,16 @@ func downloadHTTPWithPacer(ctx context.Context, cfg config, requestURL string, l
 
 func downloadQUICWithPacer(ctx context.Context, cfg config, requestURL string, localPort int, pacer *requestPacer) result {
 	tracker := &quicConnTracker{}
-	network := udpNetwork(cfg.ipv6)
-	udpConn, err := net.ListenUDP(network, &net.UDPAddr{Port: localPort})
+	udpConn, err := net.ListenUDP(cfg.endpoint.udpNetwork, &net.UDPAddr{Port: localPort})
 	if err != nil {
 		return result{port: localPort, err: fmt.Errorf("bind local UDP port %d: %w", localPort, err)}
 	}
 
 	quicTransport := &quic.Transport{Conn: udpConn}
+	udpAddr := &net.UDPAddr{IP: cfg.endpoint.ip, Port: cfg.endpoint.port}
 	transport := &http3.Transport{
 		TLSClientConfig: insecureTLSConfig(cfg.tlsConfig),
 		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
-			udpAddr, err := net.ResolveUDPAddr(network, addr)
-			if err != nil {
-				return nil, err
-			}
 			conn, err := quicTransport.Dial(ctx, udpAddr, tlsCfg, quicCfg)
 			if err != nil {
 				return nil, err
@@ -378,10 +400,143 @@ func insecureTLSConfig(base *tls.Config) *tls.Config {
 	return cfg
 }
 
-func (t *tcpConnTracker) dialContext(dialer *net.Dialer, forceIPv6 bool) func(context.Context, string, string) (net.Conn, error) {
+func (cfg config) withResolvedEndpoint(ctx context.Context) (config, error) {
+	if cfg.endpoint != nil {
+		return cfg, nil
+	}
+
+	endpoint, err := resolveEndpoint(ctx, cfg)
+	if err != nil {
+		return config{}, err
+	}
+	cfg.endpoint = endpoint
+	return cfg, nil
+}
+
+func resolveEndpoint(ctx context.Context, cfg config) (*resolvedEndpoint, error) {
+	parsed, err := url.Parse(cfg.url)
+	if err != nil {
+		return nil, err
+	}
+
+	host := parsed.Hostname()
+	if host == "" {
+		return nil, errors.New("invalid -url: missing host")
+	}
+
+	portText := parsed.Port()
+	if portText == "" {
+		portText, err = defaultPort(parsed.Scheme)
+		if err != nil {
+			return nil, err
+		}
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port %q: %w", portText, err)
+	}
+
+	ips, err := resolveHostIPs(ctx, cfg, host)
+	if err != nil {
+		return nil, err
+	}
+	ip, err := selectRemoteIP(ips, cfg.ipv6)
+	if err != nil {
+		return nil, fmt.Errorf("select IP for host %q: %w", host, err)
+	}
+
+	tcpNetwork, udpNetwork := endpointNetworks(ip)
+	return &resolvedEndpoint{
+		host:       host,
+		port:       port,
+		portText:   portText,
+		ip:         ip,
+		address:    net.JoinHostPort(ip.String(), portText),
+		tcpNetwork: tcpNetwork,
+		udpNetwork: udpNetwork,
+	}, nil
+}
+
+func defaultPort(scheme string) (string, error) {
+	switch scheme {
+	case "http":
+		return "80", nil
+	case "https", "quic":
+		return "443", nil
+	default:
+		return "", fmt.Errorf("unsupported URL scheme %q", scheme)
+	}
+}
+
+func resolveHostIPs(ctx context.Context, cfg config, host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{ip}, nil
+	}
+
+	lookupIP := cfg.lookupIP
+	if lookupIP == nil {
+		lookupIP = net.DefaultResolver.LookupIP
+	}
+
+	ips, err := lookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve host %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("resolve host %q: no IP addresses", host)
+	}
+	return ips, nil
+}
+
+func selectRemoteIP(ips []net.IP, forceIPv6 bool) (net.IP, error) {
+	if forceIPv6 {
+		if ip := firstIPv6(ips); ip != nil {
+			return ip, nil
+		}
+		return nil, errors.New("no IPv6 address available")
+	}
+
+	if ip := firstIPv4(ips); ip != nil {
+		return ip, nil
+	}
+	if ip := firstIPv6(ips); ip != nil {
+		return ip, nil
+	}
+	return nil, errors.New("no IPv4 or IPv6 address available")
+}
+
+func firstIPv4(ips []net.IP) net.IP {
+	for _, ip := range ips {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			return ipv4
+		}
+	}
+	return nil
+}
+
+func firstIPv6(ips []net.IP) net.IP {
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			if ipv6 := ip.To16(); ipv6 != nil {
+				return ipv6
+			}
+		}
+	}
+	return nil
+}
+
+func endpointNetworks(ip net.IP) (string, string) {
+	if ip.To4() != nil {
+		return "tcp4", "udp4"
+	}
+	return "tcp6", "udp6"
+}
+
+func (t *tcpConnTracker) dialContext(dialer *net.Dialer, endpoint *resolvedEndpoint) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		if forceIPv6 {
-			network = "tcp6"
+		if endpoint != nil {
+			network = endpoint.tcpNetwork
+			address = endpoint.address
 		}
 		conn, err := dialer.DialContext(ctx, network, address)
 		if err != nil {
@@ -396,13 +551,6 @@ func (t *tcpConnTracker) dialContext(dialer *net.Dialer, forceIPv6 bool) func(co
 		}
 		return conn, nil
 	}
-}
-
-func udpNetwork(forceIPv6 bool) string {
-	if forceIPv6 {
-		return "udp6"
-	}
-	return "udp"
 }
 
 func (c *trackedTCPConn) Close() error {

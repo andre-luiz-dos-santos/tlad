@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -141,6 +142,70 @@ func TestParseConfigValidation(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("error %q does not contain %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestSelectRemoteIP(t *testing.T) {
+	tests := []struct {
+		name      string
+		ips       []net.IP
+		forceIPv6 bool
+		want      string
+		wantErr   string
+	}{
+		{
+			name: "default prefers IPv4",
+			ips: []net.IP{
+				net.ParseIP("2001:db8::1"),
+				net.ParseIP("192.0.2.10"),
+			},
+			want: "192.0.2.10",
+		},
+		{
+			name: "default falls back to IPv6",
+			ips: []net.IP{
+				net.ParseIP("2001:db8::1"),
+			},
+			want: "2001:db8::1",
+		},
+		{
+			name: "IPv6 filter selects IPv6",
+			ips: []net.IP{
+				net.ParseIP("192.0.2.10"),
+				net.ParseIP("2001:db8::1"),
+			},
+			forceIPv6: true,
+			want:      "2001:db8::1",
+		},
+		{
+			name: "IPv6 filter errors without IPv6",
+			ips: []net.IP{
+				net.ParseIP("192.0.2.10"),
+			},
+			forceIPv6: true,
+			wantErr:   "no IPv6 address available",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := selectRemoteIP(tt.ips, tt.forceIPv6)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error %q does not contain %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("selectRemoteIP failed: %v", err)
+			}
+			if got.String() != tt.want {
+				t.Fatalf("selected IP %s, want %s", got, tt.want)
 			}
 		})
 	}
@@ -391,6 +456,62 @@ func TestHTTPDownloadCanForceIPv6(t *testing.T) {
 	}
 }
 
+func TestHTTPDownloadFallsBackToIPv6WhenOnlyIPv6Resolves(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+
+	remoteAddrs := make(chan string, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteAddrs <- r.RemoteAddr
+		_, _ = io.WriteString(w, "hello over ipv6")
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	serverPort := listener.Addr().(*net.TCPAddr).Port
+	var lookupCalls atomic.Int32
+	port := freeLocalIPv6Port(t)
+	res := download(context.Background(), config{
+		url:         fmt.Sprintf("http://ipv6-only.test:%d/file", serverPort),
+		bytes:       5,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
+		lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
+			lookupCalls.Add(1)
+			if network != "ip" {
+				t.Errorf("lookup network = %q, want ip", network)
+			}
+			if host != "ipv6-only.test" {
+				t.Errorf("lookup host = %q, want ipv6-only.test", host)
+			}
+			return []net.IP{net.ParseIP("::1")}, nil
+		},
+	}, port)
+
+	if res.err != nil {
+		t.Fatalf("download failed: %v", res.err)
+	}
+	if res.bytes != 5 {
+		t.Fatalf("read %d bytes, want 5", res.bytes)
+	}
+	if lookupCalls.Load() != 1 {
+		t.Fatalf("lookup calls = %d, want 1", lookupCalls.Load())
+	}
+
+	select {
+	case remoteAddr := <-remoteAddrs:
+		assertIPv6RemotePort(t, remoteAddr, port)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HTTP request")
+	}
+}
+
 func TestQUICDownloadLimitsBytesSendsRangeAndUsesUDPSourcePort(t *testing.T) {
 	var gotRange string
 	seenPort := make(chan int, 1)
@@ -424,6 +545,78 @@ func TestQUICDownloadLimitsBytesSendsRangeAndUsesUDPSourcePort(t *testing.T) {
 		t.Fatalf("quic stats unavailable: %v", res.quicStats.err)
 	}
 
+	select {
+	case got := <-seenPort:
+		if got != port {
+			t.Fatalf("request used UDP source port %d, want %d", got, port)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for QUIC request")
+	}
+}
+
+func TestQUICDownloadUsesResolvedEndpointForFakeDomain(t *testing.T) {
+	gotHost := make(chan string, 1)
+	seenPort := make(chan int, 1)
+	server := newHTTP3TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost <- r.Host
+		seenPort <- remotePortFromRequest(t, r)
+		_, _ = io.WriteString(w, strings.Repeat("q", 128))
+	}))
+
+	parsed, err := url.Parse(server.url)
+	if err != nil {
+		t.Fatalf("parse HTTP/3 server URL: %v", err)
+	}
+	_, serverPort, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("split HTTP/3 server address %q: %v", parsed.Host, err)
+	}
+
+	var lookupCalls atomic.Int32
+	port := freeLocalUDPPort(t)
+	res := download(context.Background(), config{
+		url:         fmt.Sprintf("quic://quic-download.test:%s/file", serverPort),
+		bytes:       12,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
+		lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
+			lookupCalls.Add(1)
+			if network != "ip" {
+				t.Errorf("lookup network = %q, want ip", network)
+			}
+			if host != "quic-download.test" {
+				t.Errorf("lookup host = %q, want quic-download.test", host)
+			}
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		},
+	}, port)
+
+	if res.err != nil {
+		t.Fatalf("download failed: %v", res.err)
+	}
+	if res.bytes != 12 {
+		t.Fatalf("read %d bytes, want 12", res.bytes)
+	}
+	if lookupCalls.Load() != 1 {
+		t.Fatalf("lookup calls = %d, want 1", lookupCalls.Load())
+	}
+	if !res.quicStats.available {
+		t.Fatalf("quic stats unavailable: %v", res.quicStats.err)
+	}
+
+	select {
+	case host := <-gotHost:
+		wantHost := fmt.Sprintf("quic-download.test:%s", serverPort)
+		if host != wantHost {
+			t.Fatalf("Host = %q, want %q", host, wantHost)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for QUIC host")
+	}
 	select {
 	case got := <-seenPort:
 		if got != port {
@@ -577,6 +770,110 @@ func TestRunUsesExpectedPortSequence(t *testing.T) {
 		}
 		if strings.Contains(line, " tcpinfo_error=") {
 			t.Fatalf("output line %q unexpectedly contains a tcpinfo_error field", line)
+		}
+	}
+}
+
+func TestRunResolvesHTTPHostOnceAndReusesEndpoint(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for HTTP test server: %v", err)
+	}
+
+	ports := freeLocalPortSequence(t, 3)
+	hosts := make(chan string, len(ports))
+	localAddrs := make(chan string, len(ports))
+	remotePorts := make(chan int, len(ports))
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hosts <- r.Host
+
+		localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+		if !ok {
+			t.Errorf("missing local server address")
+			return
+		}
+		localAddrs <- localAddr.String()
+
+		_, portText, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			t.Errorf("invalid remote addr %q: %v", r.RemoteAddr, err)
+			return
+		}
+		var port int
+		if _, err := fmt.Sscanf(portText, "%d", &port); err != nil {
+			t.Errorf("invalid remote port %q: %v", portText, err)
+			return
+		}
+		remotePorts <- port
+		_, _ = io.WriteString(w, "ok")
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	serverPort := listener.Addr().(*net.TCPAddr).Port
+	var lookupCalls atomic.Int32
+	var out bytes.Buffer
+	err = run(context.Background(), config{
+		url:         fmt.Sprintf("http://download.test:%d/file", serverPort),
+		bytes:       2,
+		startPort:   ports[0],
+		count:       len(ports),
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
+		lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
+			lookupCalls.Add(1)
+			if network != "ip" {
+				t.Errorf("lookup network = %q, want ip", network)
+			}
+			if host != "download.test" {
+				t.Errorf("lookup host = %q, want download.test", host)
+			}
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		},
+	}, &out)
+	if err != nil {
+		t.Fatalf("run failed: %v\noutput:\n%s", err, out.String())
+	}
+	if lookupCalls.Load() != 1 {
+		t.Fatalf("lookup calls = %d, want 1", lookupCalls.Load())
+	}
+
+	wantHost := fmt.Sprintf("download.test:%d", serverPort)
+	for i, wantPort := range ports {
+		select {
+		case got := <-hosts:
+			if got != wantHost {
+				t.Fatalf("request %d Host = %q, want %q", i, got, wantHost)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for Host from request %d", i)
+		}
+
+		select {
+		case got := <-localAddrs:
+			host, portText, err := net.SplitHostPort(got)
+			if err != nil {
+				t.Fatalf("invalid local server addr %q: %v", got, err)
+			}
+			if host != "127.0.0.1" {
+				t.Fatalf("request %d connected to server IP %q, want 127.0.0.1", i, host)
+			}
+			if portText != fmt.Sprint(serverPort) {
+				t.Fatalf("request %d connected to server port %s, want %d", i, portText, serverPort)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for local address from request %d", i)
+		}
+
+		select {
+		case got := <-remotePorts:
+			if got != wantPort {
+				t.Fatalf("request %d used local port %d, want %d", i, got, wantPort)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for remote port from request %d", i)
 		}
 	}
 }
