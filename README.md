@@ -48,7 +48,7 @@ go build -o tlad .
 | `-count` | `100` | Number of sequential requests to make. |
 | `-step` | `1` | Local port increment between requests. |
 | `-timeout` | `30s` | Per-request timeout. |
-| `-min-interval` | `1s` | Minimum time between request attempts. |
+| `-min-interval` | `2s` | Minimum time between request attempts. |
 | `-elapsed-threshold` | `5s` | Elapsed time color threshold for terminal output. |
 | `-ipv6` | `false` | Select an IPv6 address; by default TLAD prefers IPv4 and falls back to IPv6 only if no IPv4 address is available. |
 

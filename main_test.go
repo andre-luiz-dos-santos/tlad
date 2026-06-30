@@ -32,8 +32,8 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.count != 100 {
 		t.Fatalf("count = %d, want 100", cfg.count)
 	}
-	if cfg.minInterval != time.Second {
-		t.Fatalf("minInterval = %s, want 1s", cfg.minInterval)
+	if cfg.minInterval != 2*time.Second {
+		t.Fatalf("minInterval = %s, want 2s", cfg.minInterval)
 	}
 	if cfg.elapsedThreshold != 5*time.Second {
 		t.Fatalf("elapsedThreshold = %s, want 5s", cfg.elapsedThreshold)
@@ -54,7 +54,7 @@ func TestRunCLIHelp(t *testing.T) {
 	}
 
 	help := stdout.String()
-	for _, want := range []string{"Usage of tlad:", "-url", "http, https, or quic", "-bytes", "-count", "-min-interval", "-elapsed-threshold", "-ipv6", "(default 262144)", "(default 100)", "(default 1s)", "(default 5s)"} {
+	for _, want := range []string{"Usage of tlad:", "-url", "http, https, or quic", "-bytes", "-count", "-min-interval", "-elapsed-threshold", "-ipv6", "(default 262144)", "(default 100)", "(default 2s)", "(default 5s)"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help output %q does not contain %q", help, want)
 		}

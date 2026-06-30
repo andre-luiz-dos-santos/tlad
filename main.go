@@ -25,7 +25,7 @@ const (
 	defaultCount            = 100
 	defaultStep             = 1
 	defaultTimeout          = 30 * time.Second
-	defaultMinInterval      = time.Second
+	defaultMinInterval      = 2 * time.Second
 	defaultElapsedThreshold = 5 * time.Second
 
 	ansiGreen = "\x1b[32m"
