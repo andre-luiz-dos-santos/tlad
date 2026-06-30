@@ -35,6 +35,9 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.minInterval != time.Second {
 		t.Fatalf("minInterval = %s, want 1s", cfg.minInterval)
 	}
+	if cfg.elapsedThreshold != 5*time.Second {
+		t.Fatalf("elapsedThreshold = %s, want 5s", cfg.elapsedThreshold)
+	}
 	if cfg.ipv6 {
 		t.Fatal("ipv6 = true, want false")
 	}
@@ -51,7 +54,7 @@ func TestRunCLIHelp(t *testing.T) {
 	}
 
 	help := stdout.String()
-	for _, want := range []string{"Usage of tlad:", "-url", "http, https, or quic", "-bytes", "-count", "-min-interval", "-ipv6", "(default 262144)", "(default 100)", "(default 1s)"} {
+	for _, want := range []string{"Usage of tlad:", "-url", "http, https, or quic", "-bytes", "-count", "-min-interval", "-elapsed-threshold", "-ipv6", "(default 262144)", "(default 100)", "(default 1s)", "(default 5s)"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help output %q does not contain %q", help, want)
 		}
@@ -131,6 +134,16 @@ func TestParseConfigValidation(t *testing.T) {
 			name: "negative min interval",
 			args: []string{"-url", "https://example.com/file", "-min-interval", "-1s"},
 			want: "-min-interval must be greater than zero",
+		},
+		{
+			name: "zero elapsed threshold",
+			args: []string{"-url", "https://example.com/file", "-elapsed-threshold", "0"},
+			want: "-elapsed-threshold must be greater than zero",
+		},
+		{
+			name: "negative elapsed threshold",
+			args: []string{"-url", "https://example.com/file", "-elapsed-threshold", "-1s"},
+			want: "-elapsed-threshold must be greater than zero",
 		},
 	}
 
@@ -352,6 +365,86 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
 			printResult(&out, tt.res)
+			if got := out.String(); got != tt.want {
+				t.Fatalf("output = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrintResultElapsedColoring(t *testing.T) {
+	tests := []struct {
+		name string
+		res  result
+		opts resultPrintOptions
+		want string
+	}{
+		{
+			name: "disabled",
+			res: result{
+				port:    40000,
+				status:  "200 OK",
+				bytes:   24,
+				elapsed: 2 * time.Second,
+			},
+			opts: resultPrintOptions{
+				elapsedThreshold: time.Second,
+			},
+			want: "port=40000 status=\"200 OK\" bytes=24 elapsed=2s\n",
+		},
+		{
+			name: "green below threshold",
+			res: result{
+				port:    40001,
+				status:  "200 OK",
+				bytes:   24,
+				elapsed: 2 * time.Second,
+			},
+			opts: resultPrintOptions{
+				colorElapsed:     true,
+				elapsedThreshold: 5 * time.Second,
+			},
+			want: "port=40001 status=\"200 OK\" bytes=24 elapsed=\x1b[32m2s\x1b[0m\n",
+		},
+		{
+			name: "green equal threshold",
+			res: result{
+				port:    40002,
+				status:  "200 OK",
+				bytes:   24,
+				elapsed: 5 * time.Second,
+			},
+			opts: resultPrintOptions{
+				colorElapsed:     true,
+				elapsedThreshold: 5 * time.Second,
+			},
+			want: "port=40002 status=\"200 OK\" bytes=24 elapsed=\x1b[32m5s\x1b[0m\n",
+		},
+		{
+			name: "red above threshold with following fields",
+			res: result{
+				port:    40003,
+				status:  "206 Partial Content",
+				bytes:   12345,
+				elapsed: 6 * time.Second,
+				err:     context.DeadlineExceeded,
+				tcpStats: tcpStats{
+					available: true,
+					txRetrans: 2,
+				},
+			},
+			opts: resultPrintOptions{
+				colorElapsed:     true,
+				elapsedThreshold: 5 * time.Second,
+			},
+			want: "port=40003 status=\"206 Partial Content\" bytes=12345 elapsed=\x1b[31m6s\x1b[0m error=\"context deadline exceeded\" tx_retrans=2\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			printResultWithOptions(&out, tt.res, tt.opts)
 			if got := out.String(); got != tt.want {
 				t.Fatalf("output = %q, want %q", got, tt.want)
 			}

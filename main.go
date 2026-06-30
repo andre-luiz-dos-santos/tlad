@@ -20,23 +20,30 @@ import (
 )
 
 const (
-	defaultBytes       = int64(256 * 1024)
-	defaultStartPort   = 61000
-	defaultCount       = 100
-	defaultStep        = 1
-	defaultTimeout     = 30 * time.Second
-	defaultMinInterval = time.Second
+	defaultBytes            = int64(256 * 1024)
+	defaultStartPort        = 61000
+	defaultCount            = 100
+	defaultStep             = 1
+	defaultTimeout          = 30 * time.Second
+	defaultMinInterval      = time.Second
+	defaultElapsedThreshold = 5 * time.Second
+
+	ansiGreen = "\x1b[32m"
+	ansiRed   = "\x1b[31m"
+	ansiReset = "\x1b[0m"
 )
 
 type config struct {
-	url         string
-	bytes       int64
-	startPort   int
-	count       int
-	step        int
-	timeout     time.Duration
-	minInterval time.Duration
-	ipv6        bool
+	url              string
+	bytes            int64
+	startPort        int
+	count            int
+	step             int
+	timeout          time.Duration
+	minInterval      time.Duration
+	elapsedThreshold time.Duration
+	colorElapsed     bool
+	ipv6             bool
 
 	endpoint *resolvedEndpoint
 	lookupIP lookupIPFunc
@@ -108,6 +115,11 @@ type quicConnTracker struct {
 	lastStats quicStats
 }
 
+type resultPrintOptions struct {
+	colorElapsed     bool
+	elapsedThreshold time.Duration
+}
+
 type trackedTCPConn struct {
 	*net.TCPConn
 	tracker *tcpConnTracker
@@ -129,6 +141,7 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	cfg.colorElapsed = isTerminal(stdout)
 
 	if err := run(context.Background(), cfg, stdout); err != nil {
 		return 1
@@ -163,6 +176,7 @@ func newFlagSet(cfg *config) *flag.FlagSet {
 	fs.IntVar(&cfg.step, "step", defaultStep, "local port increment between requests")
 	fs.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "per-request timeout")
 	fs.DurationVar(&cfg.minInterval, "min-interval", defaultMinInterval, "minimum time between request attempts")
+	fs.DurationVar(&cfg.elapsedThreshold, "elapsed-threshold", defaultElapsedThreshold, "elapsed time color threshold")
 	fs.BoolVar(&cfg.ipv6, "ipv6", false, "select an IPv6 address instead of the default IPv4 preference")
 	return fs
 }
@@ -199,6 +213,9 @@ func (cfg config) validate() error {
 	if cfg.minInterval <= 0 {
 		return errors.New("-min-interval must be greater than zero")
 	}
+	if cfg.elapsedThreshold <= 0 {
+		return errors.New("-elapsed-threshold must be greater than zero")
+	}
 
 	lastPort := int64(cfg.startPort) + int64(cfg.count-1)*int64(cfg.step)
 	if lastPort > 65535 {
@@ -220,7 +237,10 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 	for i := 0; i < resolvedCfg.count; i++ {
 		port := resolvedCfg.startPort + i*resolvedCfg.step
 		res := downloadWithPacer(ctx, resolvedCfg, port, pacer)
-		printResult(out, res)
+		printResultWithOptions(out, res, resultPrintOptions{
+			colorElapsed:     resolvedCfg.colorElapsed,
+			elapsedThreshold: resolvedCfg.elapsedThreshold,
+		})
 		if res.err != nil {
 			failed = true
 		}
@@ -704,13 +724,17 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 }
 
 func printResult(out io.Writer, res result) {
+	printResultWithOptions(out, res, resultPrintOptions{})
+}
+
+func printResultWithOptions(out io.Writer, res result, opts resultPrintOptions) {
 	status := res.status
 	if status == "" {
 		status = "-"
 	}
 
 	fmt.Fprintf(out, "port=%d status=%q bytes=%d elapsed=%s",
-		res.port, status, res.bytes, res.elapsed.Round(time.Millisecond))
+		res.port, status, res.bytes, formatElapsed(res.elapsed, opts))
 	if res.err != nil {
 		fmt.Fprintf(out, " error=%q", res.err.Error())
 	}
@@ -735,8 +759,31 @@ func printResult(out io.Writer, res result) {
 	fmt.Fprintln(out)
 }
 
+func formatElapsed(elapsed time.Duration, opts resultPrintOptions) string {
+	rounded := elapsed.Round(time.Millisecond)
+	if !opts.colorElapsed {
+		return rounded.String()
+	}
+	if rounded <= opts.elapsedThreshold {
+		return ansiGreen + rounded.String() + ansiReset
+	}
+	return ansiRed + rounded.String() + ansiReset
+}
+
 func printResolvedEndpoint(out io.Writer, endpoint *resolvedEndpoint) {
 	fmt.Fprintf(out, "target_host=%q target_ip=%s\n", endpoint.host, endpoint.ip)
+}
+
+func isTerminal(out io.Writer) bool {
+	file, ok := out.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func printNonZeroUint32(out io.Writer, name string, value uint32) {
