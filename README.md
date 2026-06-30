@@ -57,10 +57,11 @@ go build -o tlad .
 ```text
 port=61000 status="206 Partial Content" bytes=262144 elapsed=1.421s rx_data_segs=182
 port=61001 status="206 Partial Content" bytes=262144 elapsed=863ms rx_data_segs=181
-port=61002 status="206 Partial Content" bytes=163555 elapsed=30.001s error="context deadline exceeded" tx_retrans=2 tx_retrans_bytes=96 rx_ooo=1 rx_reord_seen=1 rx_data_segs=114
+port=61002 status="206 Partial Content" bytes=163555 elapsed=30.001s+ tx_retrans=2 tx_retrans_bytes=96 rx_ooo=1 rx_reord_seen=1 rx_data_segs=114
 ```
 
 When output is written to a terminal, the elapsed value is shown in green when it is at or below `-elapsed-threshold` and red when it is above the threshold. Redirected or piped output remains plain text.
+When a request reaches `-timeout`, the elapsed value gets a trailing `+` to show the download was incomplete without treating it as an error.
 
 The TCP fields are read from the local TCP stack when supported. On Linux, `tx_retrans` is `TCP_INFO.tcpi_total_retrans`, `tx_lost_current` is `TCP_INFO.tcpi_lost`, `tx_retrans_current` is `TCP_INFO.tcpi_retrans`, `tx_retrans_bytes` is `TCP_INFO.tcpi_bytes_retrans`, `dsack_dups` is `TCP_INFO.tcpi_dsack_dups`, `rx_ooo` is `TCP_INFO.tcpi_rcv_ooopack`, `rx_reord_seen` is `TCP_INFO.tcpi_reord_seen`, and `rx_data_segs` is `TCP_INFO.tcpi_data_segs_in`.
 

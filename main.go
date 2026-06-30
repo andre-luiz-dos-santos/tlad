@@ -57,6 +57,7 @@ type result struct {
 	status     string
 	bytes      int64
 	elapsed    time.Duration
+	timedOut   bool
 	tcpStats   tcpStats
 	quicStats  quicStats
 	err        error
@@ -241,7 +242,7 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 			colorElapsed:     resolvedCfg.colorElapsed,
 			elapsedThreshold: resolvedCfg.elapsedThreshold,
 		})
-		if res.err != nil {
+		if res.err != nil && !res.timedOut {
 			failed = true
 		}
 	}
@@ -326,7 +327,7 @@ func downloadQUICWithPacer(ctx context.Context, cfg config, requestURL string, l
 func downloadWithClient(ctx context.Context, cfg config, requestURL string, localPort int, client *http.Client, pacer *requestPacer, captureStats captureStatsFunc) result {
 	for {
 		res := downloadAttempt(ctx, cfg, requestURL, localPort, client, pacer, captureStats)
-		if res.statusCode != http.StatusTooManyRequests || cfg.minInterval <= 0 {
+		if res.timedOut || res.statusCode != http.StatusTooManyRequests || cfg.minInterval <= 0 {
 			return res
 		}
 		if err := sleepContext(ctx, 10*cfg.minInterval); err != nil {
@@ -365,7 +366,7 @@ func downloadAttempt(ctx context.Context, cfg config, requestURL string, localPo
 	resp, err := client.Do(req)
 	if err != nil {
 		res.elapsed = time.Since(start)
-		res.err = err
+		markRequestTimeout(&res, ctx, reqCtx, err)
 		captureStats(&res)
 		return res
 	}
@@ -379,7 +380,7 @@ func downloadAttempt(ctx context.Context, cfg config, requestURL string, localPo
 	}
 	res.elapsed = time.Since(start)
 	if err != nil {
-		res.err = err
+		markRequestTimeout(&res, ctx, reqCtx, err)
 		_ = resp.Body.Close()
 		captureStats(&res)
 		return res
@@ -390,6 +391,14 @@ func downloadAttempt(ctx context.Context, cfg config, requestURL string, localPo
 	_ = resp.Body.Close()
 	captureStats(&res)
 	return res
+}
+
+func markRequestTimeout(res *result, parentCtx, reqCtx context.Context, err error) {
+	if parentCtx.Err() == nil && errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+		res.timedOut = true
+		return
+	}
+	res.err = err
 }
 
 func requestURLForTransport(rawURL string) (string, error) {
@@ -734,8 +743,8 @@ func printResultWithOptions(out io.Writer, res result, opts resultPrintOptions) 
 	}
 
 	fmt.Fprintf(out, "port=%d status=%q bytes=%d elapsed=%s",
-		res.port, status, res.bytes, formatElapsed(res.elapsed, opts))
-	if res.err != nil {
+		res.port, status, res.bytes, formatElapsed(res.elapsed, opts, res.timedOut))
+	if res.err != nil && !res.timedOut {
 		fmt.Fprintf(out, " error=%q", res.err.Error())
 	}
 	if res.tcpStats.available {
@@ -759,15 +768,19 @@ func printResultWithOptions(out io.Writer, res result, opts resultPrintOptions) 
 	fmt.Fprintln(out)
 }
 
-func formatElapsed(elapsed time.Duration, opts resultPrintOptions) string {
+func formatElapsed(elapsed time.Duration, opts resultPrintOptions, timedOut bool) string {
 	rounded := elapsed.Round(time.Millisecond)
+	suffix := ""
+	if timedOut {
+		suffix = "+"
+	}
 	if !opts.colorElapsed {
-		return rounded.String()
+		return rounded.String() + suffix
 	}
 	if rounded <= opts.elapsedThreshold {
-		return ansiGreen + rounded.String() + ansiReset
+		return ansiGreen + rounded.String() + ansiReset + suffix
 	}
-	return ansiRed + rounded.String() + ansiReset
+	return ansiRed + rounded.String() + ansiReset + suffix
 }
 
 func printResolvedEndpoint(out io.Writer, endpoint *resolvedEndpoint) {

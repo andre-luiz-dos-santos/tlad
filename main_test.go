@@ -280,13 +280,14 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 			want: "port=40001 status=\"-\" bytes=42 elapsed=1ms error=\"download failed\"\n",
 		},
 		{
-			name: "error with tcp stats",
+			name: "timeout with tcp stats",
 			res: result{
-				port:    40003,
-				status:  "206 Partial Content",
-				bytes:   163555,
-				elapsed: 30001 * time.Millisecond,
-				err:     context.DeadlineExceeded,
+				port:     40003,
+				status:   "206 Partial Content",
+				bytes:    163555,
+				elapsed:  30001 * time.Millisecond,
+				timedOut: true,
+				err:      context.DeadlineExceeded,
 				tcpStats: tcpStats{
 					available:        true,
 					txRetrans:        2,
@@ -299,7 +300,7 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 					rxDataSegs:       7,
 				},
 			},
-			want: "port=40003 status=\"206 Partial Content\" bytes=163555 elapsed=30.001s error=\"context deadline exceeded\" tx_retrans=2 tx_lost_current=3 tx_retrans_current=4 tx_retrans_bytes=8192 dsack_dups=5 rx_ooo=1 rx_reord_seen=6 rx_data_segs=7\n",
+			want: "port=40003 status=\"206 Partial Content\" bytes=163555 elapsed=30.001s+ tx_retrans=2 tx_lost_current=3 tx_retrans_current=4 tx_retrans_bytes=8192 dsack_dups=5 rx_ooo=1 rx_reord_seen=6 rx_data_segs=7\n",
 		},
 		{
 			name: "success without tcp stats",
@@ -421,13 +422,14 @@ func TestPrintResultElapsedColoring(t *testing.T) {
 			want: "port=40002 status=\"200 OK\" bytes=24 elapsed=\x1b[32m5s\x1b[0m\n",
 		},
 		{
-			name: "red above threshold with following fields",
+			name: "red above threshold timeout with following fields",
 			res: result{
-				port:    40003,
-				status:  "206 Partial Content",
-				bytes:   12345,
-				elapsed: 6 * time.Second,
-				err:     context.DeadlineExceeded,
+				port:     40003,
+				status:   "206 Partial Content",
+				bytes:    12345,
+				elapsed:  6 * time.Second,
+				timedOut: true,
+				err:      context.DeadlineExceeded,
 				tcpStats: tcpStats{
 					available: true,
 					txRetrans: 2,
@@ -437,7 +439,7 @@ func TestPrintResultElapsedColoring(t *testing.T) {
 				colorElapsed:     true,
 				elapsedThreshold: 5 * time.Second,
 			},
-			want: "port=40003 status=\"206 Partial Content\" bytes=12345 elapsed=\x1b[31m6s\x1b[0m error=\"context deadline exceeded\" tx_retrans=2\n",
+			want: "port=40003 status=\"206 Partial Content\" bytes=12345 elapsed=\x1b[31m6s\x1b[0m+ tx_retrans=2\n",
 		},
 	}
 
@@ -449,6 +451,22 @@ func TestPrintResultElapsedColoring(t *testing.T) {
 				t.Fatalf("output = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParentDeadlineRemainsError(t *testing.T) {
+	parentCtx, cancelParent := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancelParent()
+	reqCtx, cancelReq := context.WithTimeout(parentCtx, time.Second)
+	defer cancelReq()
+
+	res := result{}
+	markRequestTimeout(&res, parentCtx, reqCtx, context.DeadlineExceeded)
+	if res.timedOut {
+		t.Fatal("parent deadline was marked as request timeout")
+	}
+	if !errors.Is(res.err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline exceeded", res.err)
 	}
 }
 
@@ -783,8 +801,11 @@ func TestDownloadTimeoutRetainsTCPStats(t *testing.T) {
 		minInterval: time.Millisecond,
 	}, port)
 
-	if res.err == nil {
-		t.Fatal("expected timeout error")
+	if !res.timedOut {
+		t.Fatal("expected timeout marker")
+	}
+	if res.err != nil {
+		t.Fatalf("timeout was recorded as error: %v", res.err)
 	}
 	if res.statusCode != http.StatusPartialContent {
 		t.Fatalf("status code = %d, want %d", res.statusCode, http.StatusPartialContent)
@@ -799,13 +820,54 @@ func TestDownloadTimeoutRetainsTCPStats(t *testing.T) {
 	var out bytes.Buffer
 	printResult(&out, res)
 	line := out.String()
-	if !strings.Contains(line, "error=") {
-		t.Fatalf("output %q does not contain error field", line)
+	if !strings.Contains(line, " elapsed=") || !strings.Contains(line, "+") {
+		t.Fatalf("output %q does not contain timeout elapsed marker", line)
+	}
+	if strings.Contains(line, "error=") {
+		t.Fatalf("output %q contains error field", line)
 	}
 	for _, field := range []string{"tx_retrans", "tx_lost_current", "tx_retrans_current", "tx_retrans_bytes", "dsack_dups", "rx_ooo", "rx_reord_seen", "rx_data_segs"} {
 		if strings.Contains(line, field+"=0") {
 			t.Fatalf("output %q contains zero-valued %s field", line, field)
 		}
+	}
+}
+
+func TestRunTimeoutDoesNotFail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "partial body")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	port := freeLocalPort(t)
+	var out bytes.Buffer
+	err := run(context.Background(), config{
+		url:         server.URL,
+		bytes:       1024 * 1024,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     50 * time.Millisecond,
+		minInterval: time.Millisecond,
+	}, &out)
+	if err != nil {
+		t.Fatalf("run failed on timeout: %v\noutput:\n%s", err, out.String())
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("output line count = %d, want 2\noutput:\n%s", len(lines), out.String())
+	}
+	if !strings.Contains(lines[1], " elapsed=") || !strings.Contains(lines[1], "+") {
+		t.Fatalf("output %q does not contain timeout elapsed marker", lines[1])
+	}
+	if strings.Contains(lines[1], " error=") {
+		t.Fatalf("output %q contains error field", lines[1])
 	}
 }
 
