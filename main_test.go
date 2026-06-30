@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -451,6 +452,151 @@ func TestPrintResultElapsedColoring(t *testing.T) {
 				t.Fatalf("output = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestProgressPrinterWritesSameLineStatus(t *testing.T) {
+	var out bytes.Buffer
+	progress := &progressPrinter{out: &out, enabled: true}
+
+	progress.set("waiting")
+	progress.set("transferring")
+	progress.clear()
+
+	got := out.String()
+	want := "\rwaiting\x1b[K\rtransferring\x1b[K\r\x1b[K"
+	if got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "\n") {
+		t.Fatalf("progress output contains newline: %q", got)
+	}
+}
+
+func TestProgressPrinterDisabledWritesNothing(t *testing.T) {
+	var out bytes.Buffer
+	progress := &progressPrinter{out: &out}
+
+	progress.set("waiting")
+	progress.clear()
+
+	if got := out.String(); got != "" {
+		t.Fatalf("output = %q, want empty", got)
+	}
+}
+
+func TestRunProgressShowsConnectingBeforeBodyTransfer(t *testing.T) {
+	headersFlushed := make(chan struct{})
+	releaseBody := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseBody)
+		})
+	}
+	defer release()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(headersFlushed)
+		<-releaseBody
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	port := freeLocalPort(t)
+	out := newRecordingWriter()
+	progress := &progressPrinter{out: out, enabled: true}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(context.Background(), config{
+			url:         server.URL,
+			bytes:       2,
+			startPort:   port,
+			count:       1,
+			step:        1,
+			timeout:     5 * time.Second,
+			minInterval: time.Millisecond,
+			progress:    progress,
+		}, out)
+	}()
+
+	select {
+	case <-headersFlushed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for response headers")
+	}
+
+	got := waitForOutput(t, out, "\rconnecting\x1b[K", 2*time.Second)
+	if strings.Contains(got, "\rtransferring\x1b[K") {
+		t.Fatalf("output shows transferring before body bytes were released: %q", got)
+	}
+
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run failed: %v\noutput:\n%s", err, out.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for run to finish")
+	}
+
+	got = out.String()
+	connectingIndex := strings.Index(got, "\rconnecting\x1b[K")
+	transferringIndex := strings.Index(got, "\rtransferring\x1b[K")
+	finalIndex := strings.LastIndex(got, fmt.Sprintf("\r\x1b[Kport=%d status=\"206 Partial Content\"", port))
+	if connectingIndex < 0 || transferringIndex < 0 || finalIndex < 0 {
+		t.Fatalf("output missing expected progress or final result: %q", got)
+	}
+	if connectingIndex > transferringIndex || transferringIndex > finalIndex {
+		t.Fatalf("progress order is wrong: %q", got)
+	}
+}
+
+type recordingWriter struct {
+	mu     sync.Mutex
+	out    bytes.Buffer
+	writes chan string
+}
+
+func newRecordingWriter() *recordingWriter {
+	return &recordingWriter{writes: make(chan string, 100)}
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	n, err := w.out.Write(p)
+	w.mu.Unlock()
+	w.writes <- string(p)
+	return n, err
+}
+
+func (w *recordingWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.out.String()
+}
+
+func waitForOutput(t *testing.T, out *recordingWriter, want string, timeout time.Duration) string {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		got := out.String()
+		if strings.Contains(got, want) {
+			return got
+		}
+
+		select {
+		case <-out.writes:
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %q in output: %q", want, got)
+		}
 	}
 }
 
@@ -904,6 +1050,10 @@ func TestRunUsesExpectedPortSequence(t *testing.T) {
 		t.Fatalf("run failed: %v\noutput:\n%s", err, out.String())
 	}
 
+	if strings.Contains(out.String(), "\r") || strings.Contains(out.String(), "\x1b[K") {
+		t.Fatalf("non-terminal run output contains progress control bytes: %q", out.String())
+	}
+
 	for i, want := range ports {
 		select {
 		case got := <-seen:
@@ -1135,6 +1285,54 @@ func TestDownloadRetries429OnSamePortAfterBackoff(t *testing.T) {
 	secondTime := <-requestTimes
 	if elapsed := secondTime.Sub(firstTime); elapsed < 10*minInterval {
 		t.Fatalf("retry started after %s, want at least %s", elapsed, 10*minInterval)
+	}
+}
+
+func TestRunProgressShows429RetryBeforeFinalResult(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	port := freeLocalPort(t)
+	var out bytes.Buffer
+	progress := &progressPrinter{out: &out, enabled: true}
+	err := run(context.Background(), config{
+		url:         server.URL,
+		bytes:       2,
+		startPort:   port,
+		count:       1,
+		step:        1,
+		timeout:     5 * time.Second,
+		minInterval: time.Millisecond,
+		progress:    progress,
+	}, &out)
+	if err != nil {
+		t.Fatalf("run failed: %v\noutput:\n%s", err, out.String())
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+
+	got := out.String()
+	retryIndex := strings.Index(got, "\rretrying\x1b[K")
+	if retryIndex < 0 {
+		t.Fatalf("output %q does not contain retrying progress", got)
+	}
+	finalIndex := strings.LastIndex(got, fmt.Sprintf("\r\x1b[Kport=%d status=\"200 OK\"", port))
+	if finalIndex < 0 {
+		t.Fatalf("output %q does not contain cleared final result", got)
+	}
+	if retryIndex > finalIndex {
+		t.Fatalf("retrying progress appears after final result: %q", got)
+	}
+	if strings.Count(got, "\n") != 2 {
+		t.Fatalf("output newline count = %d, want 2\noutput: %q", strings.Count(got, "\n"), got)
 	}
 }
 

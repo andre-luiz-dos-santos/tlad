@@ -44,6 +44,7 @@ type config struct {
 	elapsedThreshold time.Duration
 	colorElapsed     bool
 	ipv6             bool
+	progress         *progressPrinter
 
 	endpoint *resolvedEndpoint
 	lookupIP lookupIPFunc
@@ -128,6 +129,40 @@ type trackedTCPConn struct {
 
 type captureStatsFunc func(*result)
 
+type progressPrinter struct {
+	out     io.Writer
+	enabled bool
+}
+
+type progressReader struct {
+	reader   io.Reader
+	progress *progressPrinter
+	started  bool
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && !r.started {
+		r.progress.set("transferring")
+		r.started = true
+	}
+	return n, err
+}
+
+func (p *progressPrinter) set(status string) {
+	if p == nil || !p.enabled || p.out == nil {
+		return
+	}
+	fmt.Fprintf(p.out, "\r%s\x1b[K", status)
+}
+
+func (p *progressPrinter) clear() {
+	if p == nil || !p.enabled || p.out == nil {
+		return
+	}
+	fmt.Fprint(p.out, "\r\x1b[K")
+}
+
 func main() {
 	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -142,7 +177,10 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	cfg.colorElapsed = isTerminal(stdout)
+	if isTerminal(stdout) {
+		cfg.colorElapsed = true
+		cfg.progress = &progressPrinter{out: stdout, enabled: true}
+	}
 
 	if err := run(context.Background(), cfg, stdout); err != nil {
 		return 1
@@ -238,6 +276,7 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 	for i := 0; i < resolvedCfg.count; i++ {
 		port := resolvedCfg.startPort + i*resolvedCfg.step
 		res := downloadWithPacer(ctx, resolvedCfg, port, pacer)
+		resolvedCfg.progress.clear()
 		printResultWithOptions(out, res, resultPrintOptions{
 			colorElapsed:     resolvedCfg.colorElapsed,
 			elapsedThreshold: resolvedCfg.elapsedThreshold,
@@ -330,6 +369,7 @@ func downloadWithClient(ctx context.Context, cfg config, requestURL string, loca
 		if res.timedOut || res.statusCode != http.StatusTooManyRequests || cfg.minInterval <= 0 {
 			return res
 		}
+		cfg.progress.set("retrying")
 		if err := sleepContext(ctx, 10*cfg.minInterval); err != nil {
 			res.err = fmt.Errorf("429 retry wait canceled: %w", err)
 			captureStats(&res)
@@ -343,13 +383,15 @@ func downloadAttempt(ctx context.Context, cfg config, requestURL string, localPo
 	res := result{port: localPort}
 
 	var err error
-	start, err = pacer.wait(ctx)
+	cfg.progress.set("starting")
+	start, err = pacer.wait(ctx, cfg.progress)
 	if err != nil {
 		res.elapsed = time.Since(start)
 		res.err = err
 		captureStats(&res)
 		return res
 	}
+	cfg.progress.set("starting")
 
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.timeout)
 	defer cancel()
@@ -363,6 +405,7 @@ func downloadAttempt(ctx context.Context, cfg config, requestURL string, localPo
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", cfg.bytes-1))
 
+	cfg.progress.set("connecting")
 	resp, err := client.Do(req)
 	if err != nil {
 		res.elapsed = time.Since(start)
@@ -373,11 +416,13 @@ func downloadAttempt(ctx context.Context, cfg config, requestURL string, localPo
 
 	res.statusCode = resp.StatusCode
 	res.status = resp.Status
+	reader := io.Reader(resp.Body)
 	if resp.StatusCode == http.StatusTooManyRequests && cfg.minInterval > 0 {
-		res.bytes, err = io.Copy(io.Discard, resp.Body)
+		reader = &progressReader{reader: reader, progress: cfg.progress}
 	} else {
-		res.bytes, err = io.Copy(io.Discard, io.LimitReader(resp.Body, cfg.bytes))
+		reader = &progressReader{reader: io.LimitReader(reader, cfg.bytes), progress: cfg.progress}
 	}
+	res.bytes, err = io.Copy(io.Discard, reader)
 	res.elapsed = time.Since(start)
 	if err != nil {
 		markRequestTimeout(&res, ctx, reqCtx, err)
@@ -704,13 +749,14 @@ func quicStatsForConn(conn *quic.Conn) quicStats {
 	}
 }
 
-func (p *requestPacer) wait(ctx context.Context) (time.Time, error) {
+func (p *requestPacer) wait(ctx context.Context, progress *progressPrinter) (time.Time, error) {
 	if p == nil {
 		return time.Now(), nil
 	}
 	if p.minInterval > 0 && !p.lastStart.IsZero() {
 		wait := p.minInterval - time.Since(p.lastStart)
 		if wait > 0 {
+			progress.set("waiting")
 			if err := sleepContext(ctx, wait); err != nil {
 				return time.Now(), err
 			}
