@@ -761,10 +761,13 @@ func TestRunUsesExpectedPortSequence(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if len(lines) != len(ports) {
-		t.Fatalf("output line count = %d, want %d\noutput:\n%s", len(lines), len(ports), out.String())
+	if len(lines) != len(ports)+1 {
+		t.Fatalf("output line count = %d, want %d\noutput:\n%s", len(lines), len(ports)+1, out.String())
 	}
-	for _, line := range lines {
+	if !strings.HasPrefix(lines[0], "target_host=") || !strings.Contains(lines[0], " target_ip=") {
+		t.Fatalf("resolution output line = %q, want target_host and target_ip", lines[0])
+	}
+	for _, line := range lines[1:] {
 		if strings.Contains(line, " error=") {
 			t.Fatalf("successful output line %q unexpectedly contains an error field", line)
 		}
@@ -838,6 +841,11 @@ func TestRunResolvesHTTPHostOnceAndReusesEndpoint(t *testing.T) {
 	}
 	if lookupCalls.Load() != 1 {
 		t.Fatalf("lookup calls = %d, want 1", lookupCalls.Load())
+	}
+	resolutionLine := strings.Split(strings.TrimSpace(out.String()), "\n")[0]
+	wantResolutionLine := "target_host=\"download.test\" target_ip=127.0.0.1"
+	if resolutionLine != wantResolutionLine {
+		t.Fatalf("resolution output line = %q, want %q", resolutionLine, wantResolutionLine)
 	}
 
 	wantHost := fmt.Sprintf("download.test:%d", serverPort)

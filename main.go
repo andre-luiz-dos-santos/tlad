@@ -213,6 +213,7 @@ func run(ctx context.Context, cfg config, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	printResolvedEndpoint(out, resolvedCfg.endpoint)
 
 	var failed bool
 	pacer := &requestPacer{minInterval: resolvedCfg.minInterval}
@@ -732,6 +733,10 @@ func printResult(out io.Writer, res result) {
 		printNonZeroDuration(out, "quic_smoothed_rtt", res.quicStats.smoothedRTT)
 	}
 	fmt.Fprintln(out)
+}
+
+func printResolvedEndpoint(out io.Writer, endpoint *resolvedEndpoint) {
+	fmt.Fprintf(out, "target_host=%q target_ip=%s\n", endpoint.host, endpoint.ip)
 }
 
 func printNonZeroUint32(out io.Writer, name string, value uint32) {
