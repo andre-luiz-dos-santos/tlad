@@ -21,7 +21,7 @@ import (
 
 const (
 	defaultBytes       = int64(256 * 1024)
-	defaultStartPort   = 40000
+	defaultStartPort   = 61000
 	defaultCount       = 100
 	defaultStep        = 1
 	defaultTimeout     = 30 * time.Second
