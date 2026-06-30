@@ -57,10 +57,16 @@ type requestPacer struct {
 }
 
 type tcpStats struct {
-	available bool
-	txRetrans uint32
-	rxOOO     uint32
-	err       error
+	available        bool
+	txRetrans        uint32
+	txLostCurrent    uint32
+	txRetransCurrent uint32
+	txRetransBytes   uint64
+	dsackDups        uint32
+	rxOOO            uint32
+	rxReordSeen      uint32
+	rxDataSegs       uint32
+	err              error
 }
 
 type quicStats struct {
@@ -560,7 +566,15 @@ func printResult(out io.Writer, res result) {
 		fmt.Fprintf(out, " error=%q", res.err.Error())
 	}
 	if res.tcpStats.available {
-		fmt.Fprintf(out, " tx_retrans=%d rx_ooo=%d", res.tcpStats.txRetrans, res.tcpStats.rxOOO)
+		fmt.Fprintf(out, " tx_retrans=%d tx_lost_current=%d tx_retrans_current=%d tx_retrans_bytes=%d dsack_dups=%d rx_ooo=%d rx_reord_seen=%d rx_data_segs=%d",
+			res.tcpStats.txRetrans,
+			res.tcpStats.txLostCurrent,
+			res.tcpStats.txRetransCurrent,
+			res.tcpStats.txRetransBytes,
+			res.tcpStats.dsackDups,
+			res.tcpStats.rxOOO,
+			res.tcpStats.rxReordSeen,
+			res.tcpStats.rxDataSegs)
 	}
 	if res.quicStats.available {
 		fmt.Fprintf(out, " quic_packets_lost=%d quic_bytes_lost=%d quic_packets_sent=%d quic_packets_received=%d quic_latest_rtt=%s quic_smoothed_rtt=%s",

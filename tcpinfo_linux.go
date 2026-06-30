@@ -31,9 +31,23 @@ func tcpInfoForConn(conn *net.TCPConn) tcpStats {
 		return tcpStats{err: fmt.Errorf("tcp_info: %w", tcpInfoErr)}
 	}
 
+	return tcpStatsFromInfo(info)
+}
+
+func tcpStatsFromInfo(info *unix.TCPInfo) tcpStats {
+	if info == nil {
+		return tcpStats{err: errors.New("tcp_info unavailable")}
+	}
+
 	return tcpStats{
-		available: true,
-		txRetrans: info.Total_retrans,
-		rxOOO:     info.Rcv_ooopack,
+		available:        true,
+		txRetrans:        info.Total_retrans,
+		txLostCurrent:    info.Lost,
+		txRetransCurrent: info.Retrans,
+		txRetransBytes:   info.Bytes_retrans,
+		dsackDups:        info.Dsack_dups,
+		rxOOO:            info.Rcv_ooopack,
+		rxReordSeen:      info.Reord_seen,
+		rxDataSegs:       info.Data_segs_in,
 	}
 }

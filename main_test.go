@@ -160,12 +160,18 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 				bytes:   12345,
 				elapsed: 1500 * time.Millisecond,
 				tcpStats: tcpStats{
-					available: true,
-					txRetrans: 7,
-					rxOOO:     3,
+					available:        true,
+					txRetrans:        7,
+					txLostCurrent:    1,
+					txRetransCurrent: 2,
+					txRetransBytes:   4096,
+					dsackDups:        4,
+					rxOOO:            3,
+					rxReordSeen:      5,
+					rxDataSegs:       6,
 				},
 			},
-			want: "port=40000 status=\"206 Partial Content\" bytes=12345 elapsed=1.5s tx_retrans=7 rx_ooo=3\n",
+			want: "port=40000 status=\"206 Partial Content\" bytes=12345 elapsed=1.5s tx_retrans=7 tx_lost_current=1 tx_retrans_current=2 tx_retrans_bytes=4096 dsack_dups=4 rx_ooo=3 rx_reord_seen=5 rx_data_segs=6\n",
 		},
 		{
 			name: "error without tcp stats",
@@ -187,12 +193,18 @@ func TestPrintResultOmitsUnavailableFields(t *testing.T) {
 				elapsed: 30001 * time.Millisecond,
 				err:     context.DeadlineExceeded,
 				tcpStats: tcpStats{
-					available: true,
-					txRetrans: 2,
-					rxOOO:     1,
+					available:        true,
+					txRetrans:        2,
+					txLostCurrent:    3,
+					txRetransCurrent: 4,
+					txRetransBytes:   8192,
+					dsackDups:        5,
+					rxOOO:            1,
+					rxReordSeen:      6,
+					rxDataSegs:       7,
 				},
 			},
-			want: "port=40003 status=\"206 Partial Content\" bytes=163555 elapsed=30.001s error=\"context deadline exceeded\" tx_retrans=2 rx_ooo=1\n",
+			want: "port=40003 status=\"206 Partial Content\" bytes=163555 elapsed=30.001s error=\"context deadline exceeded\" tx_retrans=2 tx_lost_current=3 tx_retrans_current=4 tx_retrans_bytes=8192 dsack_dups=5 rx_ooo=1 rx_reord_seen=6 rx_data_segs=7\n",
 		},
 		{
 			name: "success without tcp stats",
@@ -455,7 +467,7 @@ func TestDownloadTimeoutRetainsTCPStats(t *testing.T) {
 	var out bytes.Buffer
 	printResult(&out, res)
 	line := out.String()
-	for _, want := range []string{"error=", "tx_retrans=", "rx_ooo="} {
+	for _, want := range []string{"error=", "tx_retrans=", "tx_lost_current=", "tx_retrans_current=", "tx_retrans_bytes=", "dsack_dups=", "rx_ooo=", "rx_reord_seen=", "rx_data_segs="} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("output %q does not contain %q", line, want)
 		}
